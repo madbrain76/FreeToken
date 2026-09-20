@@ -94,10 +94,39 @@ def test_shard_row_parallel_and_vocab_and_replicated():
 
 
 def test_shard_replicates_vision_tower_weights():
-    cfg, world = _cfg(), 4
+    # the ViT attention is head-sharded by the model under TP, but the tower itself is
+    # replicated: _shard leaves vision names alone (they match no text sharding rule)
+    cfg, world = _cfg(), 1
     t = torch.randn(8, 4)
-    for rank in range(world):
-        assert _shard("visual.blocks.0.attn.qkv_proj.weight", t, cfg, rank, world).equal(t)
+    assert _shard("visual.blocks.0.attn.qkv_proj.weight", t, cfg, 0, world).equal(t)
+
+
+def test_iter_weights_refuses_vision_tower_under_tp(tmp_path, monkeypatch):
+    """The model head-shards its ViT attention under TP, but nobody shards the tower weights, so both readers refuse under TP > 1 (as qwen3_vl does)."""
+    from safetensors.torch import save_file
+    from freetoken.distributed.info import DistributedInfo
+    from freetoken.layers.quantization import NoQuantConfig
+    from freetoken.models.qwen4_exp import config as q4_config
+    from freetoken.models.qwen4_exp import weight as w
+
+    save_file(
+        {"model.visual.blocks.0.attn.qkv.weight": torch.randn(16, 8).to(torch.bfloat16)},
+        str(tmp_path / "model.safetensors"),
+    )
+    monkeypatch.setattr("freetoken.distributed.info._TP_INFO", DistributedInfo(rank=0, size=4))
+    monkeypatch.setattr(
+        w, "cached_load_hf_config",
+        lambda path: SimpleNamespace(architectures=["Qwen4ExpForConditionalGeneration"]),
+    )
+    monkeypatch.setattr(w, "get_model_spec", lambda arch: SimpleNamespace(packed_modules_mapping=()))
+    monkeypatch.setattr(w, "get_quant_config", lambda: NoQuantConfig())
+    monkeypatch.setattr(q4_config, "parse_config", lambda hf: SimpleNamespace())
+
+    with pytest.raises(NotImplementedError, match="vision tower"):
+        list(w.iter_weights(str(tmp_path), torch.device("cpu"),
+                            include_moe_experts=False, include_non_moe=True))
+    with pytest.raises(NotImplementedError, match="vision tower"):
+        list(w.iter_vision_weights(str(tmp_path), torch.device("cpu")))
 
 
 def test_shard_rejects_unshardable_dense_kinds():

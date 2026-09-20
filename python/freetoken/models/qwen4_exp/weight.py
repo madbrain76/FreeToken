@@ -213,12 +213,11 @@ def _shard(name: str, t: torch.Tensor, config, rank: int, world: int) -> torch.T
     ``out_proj``, shared-expert ``down_proj``. Vocab rows: ``embed_tokens`` / ``lm_head``.
     Everything else (router, indexer, norms, HC, PLE, shared-expert gate) is replicated.
 
-    The vision tower stays replicated (every rank builds its own tower); the block-fp8 dense
+    The vision tower is not sharded: its attention is head-sharded by the model under TP > 1,
+    so iter_weights refuses vision weights there, as qwen3_vl does. The block-fp8 dense
     layouts are not sharded and raise.
     """
     if world == 1:
-        return t
-    if name.startswith(VISION_KEY_PREFIXES):
         return t
     # _shard_rows slices rows, not 128x128 scale blocks, so a block-fp8 dense build cannot be sharded here.
     if name.endswith(".weight_scale_inv") or t.dtype in _FP8_DTYPES:
@@ -285,6 +284,9 @@ def iter_weights(
                     continue
                 if not include_vision and name.startswith(VISION_KEY_PREFIXES):
                     continue
+                if name.startswith(VISION_KEY_PREFIXES) and tp.size > 1:
+                    # the model head-shards its ViT attention; nobody shards the tower weights, so fail loudly like qwen3_vl
+                    raise NotImplementedError("qwen4_exp vision tower weights are not tensor-parallel sharded; run text-only (disable the vision encoder) under TP > 1")
                 tensor = f.get_tensor(raw_name)
                 fused = fuser.fuse(name, tensor)
                 if fused is None:
@@ -299,6 +301,9 @@ def iter_weights(
 
 def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
     """The vision tower alone, named as iter_weights names it."""
+    if get_tp_info().size > 1:
+        # the model head-shards its ViT attention but nobody shards the tower weights; fail loudly, as qwen3_vl does
+        raise NotImplementedError("qwen4_exp vision tower weights are not tensor-parallel sharded; run text-only (disable the vision encoder) under TP > 1")
     for file in iter_weight_files(model_path):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
