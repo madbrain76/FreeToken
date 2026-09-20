@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from freetoken.models.qwen4_exp.weight import _shard, _shard_rows
 
@@ -90,3 +91,20 @@ def test_shard_row_parallel_and_vocab_and_replicated():
     assert _shard("model.layers.0.self_attn.qkv_proj.weight", gate_up, cfg, 0, 1).equal(
         gate_up
     )
+
+
+def test_shard_replicates_vision_tower_weights():
+    cfg, world = _cfg(), 4
+    t = torch.randn(8, 4)
+    for rank in range(world):
+        assert _shard("visual.blocks.0.attn.qkv_proj.weight", t, cfg, rank, world).equal(t)
+
+
+def test_shard_rejects_unshardable_dense_kinds():
+    cfg, world = _cfg(), 2
+    scale = torch.rand(2, 4)
+    with pytest.raises(NotImplementedError):
+        _shard("model.layers.0.self_attn.qkv_proj.weight_scale_inv", scale, cfg, 0, world)
+    fp8 = torch.randn(8, 4).to(torch.float8_e4m3fn)
+    with pytest.raises(NotImplementedError):
+        _shard("model.layers.0.linear_attn.in_proj.weight", fp8, cfg, 0, world)

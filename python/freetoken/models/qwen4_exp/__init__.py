@@ -1,4 +1,4 @@
-"""Qwen3.8-Flash-Next (model_type qwen4_exp), served text-only.
+"""Qwen3.8-Flash-Next (model_type qwen4_exp); image input rides on the shared Qwen VL tower.
 
 48 decoder layers on hc_count=4 hyper-connection residual streams R [T, 4*hidden]:
 embed -> repeat(1, 4) -> [PLE at zero-based layer 1] -> per layer attn_hc.mix -> (GDN | QSA) -> attn_hc.combine -> mlp_hc.mix -> MoE -> mlp_hc.combine -> top-level mixer.mix -> lm_head.
@@ -10,10 +10,11 @@ Contracts shared across modules (do not rename):
 """
 
 from .config import parse_config
-from .model import Qwen4ExpForCausalLM
+from .model import Qwen4ExpForCausalLM, Qwen4ExpForConditionalGeneration
 from .weight import (
     ftw_side_files,
     nvfp4_expert_spec,
+    iter_vision_weights,
     iter_weights,
     load_ple_table,
 )
@@ -26,6 +27,8 @@ __all__ = [
     "ftw_side_files",
     "nvfp4_expert_spec",
     "Qwen4ExpForCausalLM",
+    "Qwen4ExpForConditionalGeneration",
+    "iter_vision_weights",
     "iter_weights",
     "load_ple_table",
     "parse_config",
