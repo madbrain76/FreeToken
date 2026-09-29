@@ -155,6 +155,11 @@ class TritonAttentionBackend(BaseAttnBackend):
         assert head_dim == q.shape[-1]
         k_cache = k_raw.view(-1, kv_heads, head_dim)
         v_cache = v_raw.view(-1, kv_heads, head_dim)
+        # An fp8 KV pool hands us its per-(token, head) scales; a 16-bit pool returns
+        # None and every kernel below keeps its original (scale-free) code path.
+        k_scale = self.kvcache.k_scale(layer_id)
+        v_scale = self.kvcache.v_scale(layer_id)
+        assert (k_scale is None) == (v_scale is None), "K and V scales come as a pair"
 
         spec = attn_spec or AttentionSpec()
         block_ends = batch.mm_block_ends if spec.bidirectional_mm_blocks else None
@@ -182,6 +187,8 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sm_scale=scale,
                 sliding_window=spec.sliding_window,
                 sinks=spec.sinks,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
         if (
             (not metadata.is_decode)
@@ -203,6 +210,8 @@ class TritonAttentionBackend(BaseAttnBackend):
                 k_extend=k.view(q.shape[0], kv_heads, head_dim),
                 v_extend=v.view(q.shape[0], kv_heads, head_dim),
                 block_ends=block_ends,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
         if block_ends is not None:
             raise NotImplementedError("bidirectional multimodal blocks need the extend kernel path")
@@ -217,6 +226,8 @@ class TritonAttentionBackend(BaseAttnBackend):
             sm_scale=scale,
             sliding_window=spec.sliding_window,
             sinks=spec.sinks,
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
 
     def prepare_metadata(self, batch: Batch) -> None:
