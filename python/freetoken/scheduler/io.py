@@ -86,37 +86,33 @@ class SchedulerIOMixin:
         return pending_msgs
 
     def _recv_msg_multi_rank0(self, blocking: bool = False) -> List[BaseBackendMsg]:
-        pending_msgs: List[BaseBackendMsg] = []
+        pending_raw_msgs: List[bytes] = []
         if blocking:
             self.run_when_idle()
-            raw = self._recv_from_tokenizer.get_raw()
-            self._send_into_ranks.put_raw(raw)
-            pending_msgs.append(self._recv_from_tokenizer.decode(raw))
+            pending_raw_msgs.append(self._recv_from_tokenizer.get_raw())
 
-        pending_raw_msgs: List[bytes] = []
         while not self._recv_from_tokenizer.empty():
             pending_raw_msgs.append(self._recv_from_tokenizer.get_raw())
 
-        # broadcast the number of raw messages to all ranks
+        for raw in pending_raw_msgs:
+            self._send_into_ranks.put_raw(raw)
+
+        # broadcast the total number of raw messages to all ranks
         src_tensor = torch.tensor(len(pending_raw_msgs))
         self.tp_cpu_group.broadcast(src_tensor, root=0).wait()
 
-        for raw in pending_raw_msgs:
-            self._send_into_ranks.put_raw(raw)
-            pending_msgs.append(self._recv_from_tokenizer.decode(raw))
-        return pending_msgs
+        return [self._recv_from_tokenizer.decode(raw) for raw in pending_raw_msgs]
 
     def _recv_msg_multi_rank1(self, blocking: bool = False) -> List[BaseBackendMsg]:
-        pending_msgs: List[BaseBackendMsg] = []
-        if blocking:
-            self.run_when_idle()
-            pending_msgs.append(self._recv_from_rank0.get())
-
         # ensure all ranks have the same number of raw messages
         dst_tensor = torch.tensor(-1)
         self.tp_cpu_group.broadcast(dst_tensor, root=0).wait()
         dst_length = int(dst_tensor.item())
 
+        if dst_length == 0 and blocking:
+            self.run_when_idle()
+
+        pending_msgs: List[BaseBackendMsg] = []
         for _ in range(dst_length):
             pending_msgs.append(self._recv_from_rank0.get())
         return pending_msgs

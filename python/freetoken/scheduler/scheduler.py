@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
@@ -309,12 +310,65 @@ class Scheduler(SchedulerIOMixin):
         self.sync_all_ranks()
         self.engine.shutdown()
 
+    def _wait_copy_done(
+        self, copy_done: torch.cuda.Event, batch: Batch, timeout: float = 120.0
+    ) -> None:
+        """Synchronize copy_done with an operational step timeout.
+
+        Avoids indefinite CPU spin-wait during GPU or NCCL collective hangs.
+        If timeout is exceeded, sends ErrorReplyMsg to abort the affected requests
+        and raises TimeoutError to trigger a clean supervisor restart.
+        """
+        if copy_done.query():
+            return
+
+        start_time = time.monotonic()
+        while not copy_done.query():
+            elapsed = time.monotonic() - start_time
+            if elapsed > timeout:
+                logger.error_rank0(
+                    f"Forward step execution timed out after {elapsed:.1f}s (operational limit: {timeout}s)! "
+                    f"Possible GPU desync or NCCL collective deadlock across {len(batch.reqs)} active request(s)."
+                )
+                error_replies = []
+                for req in batch.reqs:
+                    logger.error_rank0(
+                        f"Dropping timed-out request {req.uid} (prompt_len={len(req.input_ids)}, "
+                        f"output_len={len(req.output_ids)})."
+                    )
+                    error_replies.append(
+                        ErrorReplyMsg(
+                            uid=req.uid,
+                            error=f"GPU forward execution timed out after {elapsed:.1f}s (operational limit: {timeout}s).",
+                            code="timeout",
+                        )
+                    )
+                    try:
+                        self._free_req_resources(req)
+                    except Exception as e:
+                        logger.warning(f"Error freeing resources for req {req.uid}: {e}")
+
+                if error_replies:
+                    try:
+                        self.send_result(error_replies)
+                    except Exception as e:
+                        logger.warning(f"Failed to send error replies for timed-out batch: {e}")
+
+                raise TimeoutError(
+                    f"GPU forward execution timed out after {elapsed:.1f}s (operational timeout: {timeout}s)."
+                )
+
+            # Yield CPU slightly after 5ms to avoid 100% CPU spinning while waiting for GPU
+            if elapsed > 0.005:
+                time.sleep(0.001)
+
     def _process_last_data(self, last_data: ForwardData | None) -> None:
         if last_data is None:
             return
 
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
-        copy_done.synchronize()
+        timeout = getattr(self.config, "step_timeout", None) or ENV.STEP_TIMEOUT.value
+        self._wait_copy_done(copy_done, batch, timeout=timeout)
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():

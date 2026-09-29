@@ -355,6 +355,20 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--step-timeout",
+        type=float,
+        default=ServerArgs.step_timeout,
+        help="Operational timeout in seconds for a single forward execution step (default: 120s).",
+    )
+
+    parser.add_argument(
+        "--distributed-timeout",
+        type=float,
+        default=ServerArgs.distributed_timeout,
+        help="Timeout in seconds for idle/rendezvous distributed communication (default: 2592000s = 30 days).",
+    )
+
+    parser.add_argument(
         "--cuda-graph-max-bs",
         "--graph",
         type=int,

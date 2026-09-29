@@ -517,10 +517,13 @@ class Engine:
                 backend="nccl",
                 rank=config.tp_info.rank,
                 world_size=config.tp_info.size,
-                timeout=timedelta(seconds=config.distributed_timeout),
+                timeout=timedelta(seconds=getattr(config, "step_timeout", 120.0)),
                 init_method=config.distributed_addr,
             )
-            tp_cpu_group = torch.distributed.new_group(backend="gloo")
+            tp_cpu_group = torch.distributed.new_group(
+                backend="gloo",
+                timeout=timedelta(seconds=config.distributed_timeout),
+            )
             assert tp_cpu_group is not None
         return tp_cpu_group
 
