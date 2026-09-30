@@ -70,10 +70,8 @@ def test_constexpr_probe_never_references_a_host_function():
     )
 
 
-# ======================================================================================
-# 1. Primitives vs the native fp8 unit (needs sm_89+ hardware for the reference).
-# ======================================================================================
-@pytest.mark.skipif(not torch.cuda.is_available() or not _native_cc(),
+# ===============================================================================# 1. Primitives vs the native fp8 unit (needs sm_89+ hardware for the reference).
+# ===============================================================================@pytest.mark.skipif(not torch.cuda.is_available() or not _native_cc(),
                     reason="needs native fp8 (sm_89+) as reference")
 class TestPrimitives:
     def test_decode_f32_bitexact(self):
@@ -185,10 +183,8 @@ def test_kv_tile_scaled16_agrees_with_the_f32_loader():
     assert not wide[n:].any() and not narrow[n:].any()
 
 
-# ======================================================================================
-# Shared emit path: every affected wrapper, deterministic inputs.
-# ======================================================================================
-def _emit_all(path: str) -> None:
+# ===============================================================================# Shared emit path: every affected wrapper, deterministic inputs.
+# ===============================================================================def _emit_all(path: str) -> None:
     from freetoken.kernel.triton.e4m3_compat import e4m3_native
     from freetoken.kernel.triton.dsv4.fp8_linear import (
         act_quant_fp8, act_quant_fp8_inplace, act_quant_fp8_roundtrip,
@@ -354,6 +350,22 @@ def _emit_all(path: str) -> None:
         (codes_to_f32(kc4) * k_sc.view(pages, page, kvh, 1)).to(torch.bfloat16),
         (codes_to_f32(vc4) * v_sc.view(pages, page, kvh, 1)).to(torch.bfloat16),
         sel, table, t2r))
+    # a K no tile divides takes the masked loads, whose fill value must suit an fp8 pointer
+    Kr, H5, I5 = 272, 272, 80
+    pkr = torch.randint(0, 256, (N, Kr // 2), dtype=torch.uint8, device=dev)
+    scr = (torch.rand(N, Kr // 16, device=dev) * 2 + 0.1).to(FP8)
+    out["nv_gemm_inkernel_ragged_k"] = f32(nvfp4_dense_linear(
+        torch.randn(8, Kr, dtype=torch.bfloat16, device=dev), pkr, scr, g))
+    gup5 = torch.randint(0, 256, (S, 2 * I5, H5 // 2), dtype=torch.uint8, device=dev)
+    gus5 = (torch.rand(S, 2 * I5, H5 // 16, device=dev) + 0.1).to(FP8)
+    gug5 = (torch.rand(S, 2 * I5, device=dev) * 0.05 + 0.01).to(torch.float16)
+    dnp5 = torch.randint(0, 256, (S, H5, I5 // 2), dtype=torch.uint8, device=dev)
+    dns5 = (torch.rand(S, H5, I5 // 16, device=dev) + 0.1).to(FP8)
+    dng5 = (torch.rand(S, H5, device=dev) * 0.05 + 0.01).to(torch.float16)
+    out["nv_moe_prefill_ragged_k"] = f32(fused_experts_nvfp4(
+        torch.randn(2, H5, dtype=torch.bfloat16, device=dev),
+        gup5, gus5, gug5, dnp5, dns5, dng5, tw, tids, S))
+
     torch.save(out, path)
 
 
@@ -368,10 +380,8 @@ def _child_env(tmp_path, **extra) -> dict:
     return env
 
 
-# ======================================================================================
-# 2. Forced-EMU vs native A/B across every wrapper.
-# ======================================================================================
-@pytest.mark.slow
+# ===============================================================================# 2. Forced-EMU vs native A/B across every wrapper.
+# ===============================================================================@pytest.mark.slow
 @pytest.mark.skipif(not torch.cuda.is_available() or not _native_cc(),
                     reason="needs native fp8 (sm_89+) as reference")
 def test_forced_emu_matches_native(tmp_path):
@@ -393,10 +403,8 @@ def test_forced_emu_matches_native(tmp_path):
             assert torch.equal(a[k], b[k]), f"{k}: EMU output differs from native"
 
 
-# ======================================================================================
-# 3. Cross-arch compile gate (full wrapper->kernel paths, compile-only).
-# ======================================================================================
-@pytest.mark.slow
+# ===============================================================================# 3. Cross-arch compile gate (full wrapper->kernel paths, compile-only).
+# ===============================================================================@pytest.mark.slow
 @pytest.mark.parametrize("arch", [80, 86, 89, 120])
 def test_compile_gate_foreign_arch(arch, tmp_path):
     r = subprocess.run(
