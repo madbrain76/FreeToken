@@ -25,9 +25,10 @@ def _probe(fn) -> None:
     branch) or a driver without batch-memcpy support loads cleanly and only fails
     at call time; probing here turns every such mode into a load_batch_memcpy
     exception the caller's fallback path can catch."""
-    src = torch.arange(16, dtype=torch.uint8).pin_memory()
-    dst = torch.zeros(16, dtype=torch.uint8, device="cuda")
-    stream = torch.cuda.Stream()
+    device = torch.cuda.current_device()
+    src = torch.arange(16, dtype=torch.uint8).pin_memory(device=device)
+    dst = torch.zeros(16, dtype=torch.uint8, device=device)
+    stream = torch.cuda.Stream(device=device)
     fn(
         torch.tensor([dst.data_ptr()]),
         torch.tensor([src.data_ptr()]),
@@ -35,6 +36,7 @@ def _probe(fn) -> None:
         stream.cuda_stream,
     )
     stream.synchronize()
+    torch.cuda.synchronize(device)
     if not torch.equal(dst.cpu(), src):
         raise RuntimeError("cudaMemcpyBatchAsync probe copied wrong bytes")
 

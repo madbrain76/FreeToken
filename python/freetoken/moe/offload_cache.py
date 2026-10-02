@@ -288,6 +288,8 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        if self.prefill_hit_d2d:
+            self._resolve_batch_memcpy()
 
     def set_bank_sources(
         self,
@@ -741,6 +743,7 @@ class OffloadMoeCache:
                 from freetoken.kernel.batch_memcpy import load_batch_memcpy
 
                 self._batch_memcpy = load_batch_memcpy()
+                logger.info_rank0("MoE prefill hit-D2D: batch_memcpy successfully initialized")
             except Exception as exc:  # noqa: BLE001 -- any build/runtime gap => legacy path
                 logger.warning(f"MoE prefill hit-D2D disabled ({exc}); using full-layer copies")
                 self._batch_memcpy = False
