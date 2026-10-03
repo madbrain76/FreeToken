@@ -19,6 +19,7 @@ from freetoken.kernel.aot_models import SUPPORTED_MODELS, expert_bank_row_bytes
 from freetoken.models.qwen4_exp.weight import (
     _ZERO_CENTERED_NORM_SUFFIXES,
     _DenseFuser,
+    _shard_vision_tensor,
     iter_weights,
     load_ple_table,
 )
@@ -229,6 +230,28 @@ def loaded_fp8(checkpoint_fp8) -> dict[str, torch.Tensor]:
 
 def test_tower_keys_come_out_under_the_prefix_load_weight_filters(loaded):
     assert {n for n in loaded if "visual" in n} == {"visual.blocks.0.attn.qkv.weight", "visual.merger.norm.weight"}
+
+
+def test_vision_tp_sharding_matches_the_parallel_layer_layout():
+    qkv = torch.arange(3 * 8 * 4).view(3 * 8, 4)
+    col = torch.arange(16 * 4).view(16, 4)
+    row = torch.arange(4 * 16).view(4, 16)
+    bias = torch.arange(4)
+
+    for rank in range(4):
+        got_qkv = _shard_vision_tensor("visual.blocks.0.attn.qkv.weight", qkv, rank, 4)
+        expected_qkv = torch.cat([part.chunk(4, dim=0)[rank] for part in qkv.chunk(3, dim=0)])
+        assert torch.equal(got_qkv, expected_qkv)
+        assert torch.equal(
+            _shard_vision_tensor("visual.blocks.0.mlp.linear_fc1.weight", col, rank, 4),
+            col.chunk(4, dim=0)[rank],
+        )
+        assert torch.equal(
+            _shard_vision_tensor("visual.blocks.0.mlp.linear_fc2.weight", row, rank, 4),
+            row.chunk(4, dim=1)[rank],
+        )
+        got_bias = _shard_vision_tensor("visual.blocks.0.mlp.linear_fc2.bias", bias, rank, 4)
+        assert torch.equal(got_bias, bias if rank == 0 else torch.zeros_like(bias))
 
 
 def test_mtp_experts_and_table_never_loaded(loaded):

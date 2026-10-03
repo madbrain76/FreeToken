@@ -204,6 +204,34 @@ def _shard_rows(
     return torch.cat(out, dim=0)
 
 
+def _shard_vision_tensor(name: str, tensor: torch.Tensor, rank: int, world: int) -> torch.Tensor:
+    """Return one TP rank's ViT tensor, matching the parallel vision layers."""
+    if world == 1 or not name.startswith("visual."):
+        return tensor
+
+    if ".attn.qkv." in name:
+        # The checkpoint packs equally sized Q, K, and V blocks.  Splitting the
+        # combined rows directly can cross a Q/K/V boundary for some TP sizes.
+        assert tensor.shape[0] % 3 == 0, f"unexpected QKV shape for {name}: {tuple(tensor.shape)}"
+        qkv = tensor.view(3, tensor.shape[0] // 3, *tensor.shape[1:])
+        return torch.cat(tuple(qkv.chunk(world, dim=1)[rank]), dim=0).clone()
+
+    if name.endswith((".mlp.linear_fc1.weight", ".mlp.linear_fc1.bias", ".merger.linear_fc1.weight", ".merger.linear_fc1.bias")):
+        return tensor.chunk(world, dim=0)[rank].clone()
+
+    if name.endswith((".attn.proj.weight", ".mlp.linear_fc2.weight", ".merger.linear_fc2.weight")):
+        return tensor.chunk(world, dim=1)[rank].clone()
+
+    if name.endswith((".attn.proj.bias", ".mlp.linear_fc2.bias", ".merger.linear_fc2.bias")):
+        # Row-parallel layers all-reduce their outputs.  Load this bias on one
+        # rank only so that reduction adds it exactly once.
+        return tensor.clone() if rank == 0 else torch.zeros_like(tensor)
+
+    # Patch embedding, position table, and normalization weights are consumed
+    # before or between TP collectives, so every rank needs an identical copy.
+    return tensor
+
+
 def _shard(name: str, t: torch.Tensor, config, rank: int, world: int) -> torch.Tensor:
     """TP shard of one state-dict tensor (fused projections included); identity at TP=1.
 
@@ -213,9 +241,8 @@ def _shard(name: str, t: torch.Tensor, config, rank: int, world: int) -> torch.T
     ``out_proj``, shared-expert ``down_proj``. Vocab rows: ``embed_tokens`` / ``lm_head``.
     Everything else (router, indexer, norms, HC, PLE, shared-expert gate) is replicated.
 
-    The vision tower is not sharded: its attention is head-sharded by the model under TP > 1,
-    so iter_weights refuses vision weights there, as qwen3_vl does. The block-fp8 dense
-    layouts are not sharded and raise.
+    The vision tower follows its ``LinearQKVMerged`` / column-parallel / row-parallel layer
+    layout. The block-fp8 dense layouts are not sharded and raise.
     """
     if world == 1:
         return t
@@ -284,10 +311,10 @@ def iter_weights(
                     continue
                 if not include_vision and name.startswith(VISION_KEY_PREFIXES):
                     continue
-                if name.startswith(VISION_KEY_PREFIXES) and tp.size > 1:
-                    # the model head-shards its ViT attention; nobody shards the tower weights, so fail loudly like qwen3_vl
-                    raise NotImplementedError("qwen4_exp vision tower weights are not tensor-parallel sharded; run text-only (disable the vision encoder) under TP > 1")
                 tensor = f.get_tensor(raw_name)
+                if name.startswith(VISION_KEY_PREFIXES):
+                    yield name, _shard_vision_tensor(name, tensor, tp.rank, tp.size)
+                    continue
                 fused = fuser.fuse(name, tensor)
                 if fused is None:
                     fuser.check_unfused(name, tensor)
@@ -301,15 +328,13 @@ def iter_weights(
 
 def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple[str, torch.Tensor]]:
     """The vision tower alone, named as iter_weights names it."""
-    if get_tp_info().size > 1:
-        # the model head-shards its ViT attention but nobody shards the tower weights; fail loudly, as qwen3_vl does
-        raise NotImplementedError("qwen4_exp vision tower weights are not tensor-parallel sharded; run text-only (disable the vision encoder) under TP > 1")
+    tp = get_tp_info()
     for file in iter_weight_files(model_path):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
                 name = _rename(raw_name)
                 if name is not None and name.startswith(VISION_KEY_PREFIXES):
-                    yield name, f.get_tensor(raw_name)
+                    yield name, _shard_vision_tensor(name, f.get_tensor(raw_name), tp.rank, tp.size)
 
 
 # ======================================================================================
