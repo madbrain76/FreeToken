@@ -5,11 +5,39 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
 
+from freetoken.kernel.triton.e4m3_compat import KV_TILE_SCALE
 from freetoken.kernel.triton.e4m3_compat import kv_load_e4m3_tile_f32
+from freetoken.kernel.triton.e4m3_compat import kv_load_e4m3_tile_scaled16
+
+
+# The scaled16 fast path changes the final BF16 rounding order.  Keep the legacy,
+# bit-exact reconstruction as the default until model-quality evaluation approves it.
+QSA_FP8_FAST_SCALE = os.environ.get("FREETOKEN_QSA_FP8_FAST_SCALE", "").lower() in (
+    "1", "true", "yes", "on",
+)
+
+
+@triton.jit
+def _qsa_dequant_scale(scale_ptr, slots, stride, kv_head, mask):
+    """Load a row scale and repay ``kv_load_e4m3_tile_scaled16``'s 1/256.
+
+    Applying this after the K dot / before the V dot keeps the FP8 tiles in fp16.
+    The original QSA implementation widened and scaled every KV element to fp32,
+    unlike the generic paged-attention FP8 path.  A scale is constant across the
+    reduction dimension, so the algebra is unchanged while the work moves from
+    [head_dim, tile] tensors to [query_heads, tile] score/probability tensors.
+    """
+    return tl.load(
+        scale_ptr + slots * stride + kv_head,
+        mask=mask,
+        other=0.0,
+    ) * KV_TILE_SCALE
 
 
 @triton.jit
@@ -56,6 +84,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     # 16-bit values. The bf16 branch below stays exactly as it was, instruction for
     # instruction, for the unquantized default.
     HAS_KV_SCALE: tl.constexpr,
+    FAST_FP8_SCALE: tl.constexpr,
 ) -> None:
     # row * stride can overflow int32 for large row counts.
     row = tl.program_id(0).to(tl.int64)
@@ -120,38 +149,60 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             # were never written read back 0.0 * 0.0 -- both buffers are zero-filled.
             # Either way the operand stays finite, so the -inf row mask below is what
             # decides such a column's fate rather than a NaN poisoning the row.
-            s_k = tl.load(
-                k_scale_ptr + scale_slot[None, :] * stride_kss + kv_head,
-                mask=valid[None, :],
-                other=1.0,
-            )
-            s_v = tl.load(
-                v_scale_ptr + scale_slot[:, None] * stride_vss + kv_head,
-                mask=valid[:, None],
-                other=1.0,
-            )
-            keys = (
-                kv_load_e4m3_tile_f32(
+            if FAST_FP8_SCALE:
+                s_k = _qsa_dequant_scale(
+                    k_scale_ptr, scale_slot[None, :], stride_kss, kv_head, valid[None, :]
+                )
+                s_v = _qsa_dequant_scale(
+                    v_scale_ptr, scale_slot, stride_vss, kv_head, valid
+                )
+                keys = kv_load_e4m3_tile_scaled16(
                     k_cache_ptr
                     + safe_page[None, :] * stride_k_block
                     + page_offset[None, :] * stride_k_token
                     + kv_head * stride_k_head
                     + dim_offsets[:, None],
                     valid[None, :],
-                )
-                * s_k
-            ).to(query.dtype)
-            values = (
-                kv_load_e4m3_tile_f32(
+                ).to(query.dtype)
+                values = kv_load_e4m3_tile_scaled16(
                     v_cache_ptr
                     + safe_page[:, None] * stride_v_block
                     + page_offset[:, None] * stride_v_token
                     + kv_head * stride_v_head
                     + dim_offsets[None, :],
                     valid[:, None],
-                )
-                * s_v
-            ).to(query.dtype)
+                ).to(query.dtype)
+            else:
+                s_k = 1.0
+                s_v = 1.0
+                keys = (
+                    kv_load_e4m3_tile_f32(
+                        k_cache_ptr
+                        + safe_page[None, :] * stride_k_block
+                        + page_offset[None, :] * stride_k_token
+                        + kv_head * stride_k_head
+                        + dim_offsets[:, None],
+                        valid[None, :],
+                    )
+                    * tl.load(
+                        k_scale_ptr + scale_slot[None, :] * stride_kss + kv_head,
+                        mask=valid[None, :], other=1.0,
+                    )
+                ).to(query.dtype)
+                values = (
+                    kv_load_e4m3_tile_f32(
+                        v_cache_ptr
+                        + safe_page[:, None] * stride_v_block
+                        + page_offset[:, None] * stride_v_token
+                        + kv_head * stride_v_head
+                        + dim_offsets[None, :],
+                        valid[:, None],
+                    )
+                    * tl.load(
+                        v_scale_ptr + scale_slot[:, None] * stride_vss + kv_head,
+                        mask=valid[:, None], other=1.0,
+                    )
+                ).to(query.dtype)
         else:
             keys = tl.load(
                 k_cache_ptr
@@ -174,14 +225,21 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
+        if HAS_KV_SCALE and FAST_FP8_SCALE:
+            scores *= s_k
         scores = tl.where(valid[None, :], scores, -1.0e20)
         next_max = tl.maximum(max_value, tl.max(scores, axis=1))
         alpha = tl.math.exp2(max_value - next_max)
         probabilities = tl.where(
             valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
         )
+        value_weights = (
+            probabilities * s_v[None, :]
+            if HAS_KV_SCALE and FAST_FP8_SCALE
+            else probabilities
+        )
         accumulator = tl.dot(
-            probabilities.to(values.dtype),
+            value_weights.to(values.dtype),
             values,
             acc=accumulator * alpha[:, None],
         )
@@ -411,6 +469,7 @@ def qsa_sparse_paged_attention(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         HAS_KV_SCALE=k_scale is not None,
+        FAST_FP8_SCALE=QSA_FP8_FAST_SCALE,
         num_warps=partial_warps,
         num_stages=2,
     )
