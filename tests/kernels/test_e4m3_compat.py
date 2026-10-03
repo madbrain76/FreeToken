@@ -70,8 +70,34 @@ def test_constexpr_probe_never_references_a_host_function():
     )
 
 
-# ===============================================================================# 1. Primitives vs the native fp8 unit (needs sm_89+ hardware for the reference).
-# ===============================================================================@pytest.mark.skipif(not torch.cuda.is_available() or not _native_cc(),
+
+@pytest.mark.skipif(torch.version.hip is None, reason="needs ROCm")
+def test_rocm_host_and_compile_time_native_gates_match():
+    """The host wrapper and Triton constexpr must choose the same buffer ABI."""
+    import triton
+    import triton.language as tl
+
+    from freetoken.kernel.triton.e4m3_compat import e4m3_native, e4m3_native_cx
+
+    @triton.jit
+    def gate_kernel(output):
+        if e4m3_native_cx():
+            value = 1
+        else:
+            value = 0
+        tl.store(output, value)
+
+    output = torch.empty(1, dtype=torch.int32, device="cuda")
+    gate_kernel[(1,)](output)
+
+    assert e4m3_native() is False
+    assert output.item() == int(e4m3_native())
+
+
+# ======================================================================================
+# 1. Primitives vs the native fp8 unit (needs sm_89+ hardware for the reference).
+# ======================================================================================
+@pytest.mark.skipif(not torch.cuda.is_available() or not _native_cc(),
                     reason="needs native fp8 (sm_89+) as reference")
 class TestPrimitives:
     def test_decode_f32_bitexact(self):
