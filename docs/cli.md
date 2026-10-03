@@ -93,10 +93,10 @@ trade-offs:
   and are decoded in software, so the cache holds identical data and produces identical
   numbers on any card (the fp8 type is deliberately kept out of the kernels, which is
   also what makes the feature work on the RTX 30 series).
-- `FREETOKEN_QSA_FP8_FAST_SCALE=1` enables the experimental Qwen3.8 QSA read fast
-  path. It keeps decoded FP8 tiles in fp16 and applies each row scale around the two
-  dot products, substantially reducing prefill cost on FP8 KV. It changes final BF16
-  rounding order, so validate model quality before enabling it in production.
+- Qwen3.8 FP8-QSA uses the fast scaled16 read path by default. It keeps decoded FP8
+  tiles in fp16 and applies each row scale around the two dot products, substantially
+  reducing prefill cost on FP8 KV. Set `FREETOKEN_QSA_FP8_FAST_SCALE=0` to select the
+  legacy, bit-exact reconstruction; the fast path changes final BF16 rounding order.
 - Accuracy is checkpoint-dependent. Expect it to matter most on long contexts and on
   models with outlier key channels; keep `bf16` when a run must be bit-reproducible.
 - `ft ctl stats` / `/v1/cache/status` report the smaller `kv_bytes_per_token`, and

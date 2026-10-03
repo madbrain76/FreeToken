@@ -16,10 +16,10 @@ from freetoken.kernel.triton.e4m3_compat import kv_load_e4m3_tile_f32
 from freetoken.kernel.triton.e4m3_compat import kv_load_e4m3_tile_scaled16
 
 
-# The scaled16 fast path changes the final BF16 rounding order.  Keep the legacy,
-# bit-exact reconstruction as the default until model-quality evaluation approves it.
-QSA_FP8_FAST_SCALE = os.environ.get("FREETOKEN_QSA_FP8_FAST_SCALE", "").lower() in (
-    "1", "true", "yes", "on",
+# FP8-QSA defaults to the scaled16 fast path.  Set
+# FREETOKEN_QSA_FP8_FAST_SCALE=0 for the legacy, bit-exact reconstruction.
+QSA_FP8_FAST_SCALE = os.environ.get("FREETOKEN_QSA_FP8_FAST_SCALE", "1").lower() not in (
+    "0", "false", "no", "off",
 )
 
 
