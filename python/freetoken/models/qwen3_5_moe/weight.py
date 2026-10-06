@@ -349,8 +349,6 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | 
     ``_scale`` (block scale) companions, named as the checkpoint's dialect stores them. Other expert kinds use the generic readers."""
     if kind is not QuantKind.FP8_BLOCK:
         return None
-    if get_tp_info().size > 1:
-        raise NotImplementedError("qwen3_5_moe fp8 expert banks support TP=1 only")
     from freetoken.models.weight import experts_scattered, iter_expert_tensors_parallel
     from freetoken.moe.expert_pieces import per_expert_pieces
 
@@ -358,6 +356,29 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | 
     scale = get_quant_config().stored_tensors(QuantKind.FP8_BLOCK)["weight_scale_inv"].name
     key_re = re.compile(_FP8_EXPERT_KEY_RE.format(scale=re.escape(scale)))
     suffix = {"weight": "", scale: "_scale"}
+
+    tp = get_tp_info()
+    blocks = I // 128
+    if I % 128 or blocks < tp.size:
+        raise ValueError(
+            f"block-fp8 TP needs at least one 128-wide block per rank; got intermediate={I}, tp={tp.size}"
+        )
+    block_lo = tp.rank * blocks // tp.size
+    block_hi = (tp.rank + 1) * blocks // tp.size
+
+    def _tp_shard(role: str, tensor: torch.Tensor) -> torch.Tensor:
+        """Preserve 128x128 scale blocks while sharding the expert I axis."""
+        if tp.size == 1:
+            return tensor
+        lo, hi = block_lo * 128, block_hi * 128
+        if role in ("gate", "up"):
+            return tensor[lo:hi]
+        if role in ("gate_scale", "up_scale"):
+            return tensor[block_lo:block_hi]
+        if role == "down":
+            return tensor[:, lo:hi]
+        assert role == "down_scale", role
+        return tensor[:, block_lo:block_hi]
 
     def locate(raw_name: str):
         m = key_re.match(raw_name)
@@ -389,7 +410,13 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | 
         finally:
             reader.close()
 
-    return per_expert_pieces(_serial(), locate, tensors_per_expert=6)
+    def _sharded_serial():
+        for name, tensor in _serial():
+            hit = locate(name)
+            assert hit is not None
+            yield name, _tp_shard(hit[2], tensor)
+
+    return per_expert_pieces(_sharded_serial(), locate, tensors_per_expert=6)
 
 
 def nvfp4_expert_spec(model_path: str, config) -> Nvfp4ExpertSourceSpec:

@@ -21,7 +21,7 @@ class TritonFp8BlockMoEKernel(MoEKernel):
     name = "triton"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        reason = self._common_reject(cfg, tp_ok=False, cpu_ok=False, plain_silu_only=False)
+        reason = self._common_reject(cfg, resident_ok=True, tp_ok=True, cpu_ok=False, plain_silu_only=False)
         if reason:
             return reason
         reason = gated_epilogue_reason(cfg)
@@ -32,7 +32,17 @@ class TritonFp8BlockMoEKernel(MoEKernel):
         return None
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
-        i, h, b = cfg.intermediate, cfg.hidden, BLOCK
+        # Split on whole 128-wide scale blocks.  640-wide Qwen3.8 experts on
+        # TP4 become [128, 128, 128, 256], rather than invalid 160-wide slices.
+        blocks = cfg.intermediate // BLOCK
+        if cfg.intermediate % BLOCK or blocks < cfg.tp_size:
+            raise ValueError(
+                f"block-fp8 TP needs at least one 128-wide block per rank; "
+                f"got intermediate={cfg.intermediate}, tp={cfg.tp_size}"
+            )
+        lo = cfg.tp_rank * blocks // cfg.tp_size
+        hi = (cfg.tp_rank + 1) * blocks // cfg.tp_size
+        i, h, b = (hi - lo) * BLOCK, cfg.hidden, BLOCK
         return {
             "gate_up": BankSpec((2 * i, h), FP8),
             "gate_up_scale": BankSpec((2 * i // b, _pad_scale(2 * i // b, h // b)), torch.bfloat16),
@@ -64,3 +74,20 @@ class TritonFp8BlockMoEKernel(MoEKernel):
 @register_method(QuantKind.FP8_BLOCK, LayerKind.MOE)
 class Fp8BlockMoEMethod(MoEMethod):
     candidates = (TritonFp8BlockMoEKernel,)
+
+    def create_weights(self, layer) -> None:
+        g = self.cfg
+        blocks = g.intermediate // BLOCK
+        lo = g.tp_rank * blocks // g.tp_size
+        hi = (g.tp_rank + 1) * blocks // g.tp_size
+        e, i, h, b = g.num_experts, (hi - lo) * BLOCK, g.hidden, BLOCK
+        layer.gate_up_proj = torch.empty(e, 2 * i, h, dtype=FP8)
+        layer.gate_up_scale_inv = torch.empty(e, 2 * i // b, h // b, dtype=torch.bfloat16)
+        layer.down_proj = torch.empty(e, h, i, dtype=FP8)
+        layer.down_scale_inv = torch.empty(e, h // b, i // b, dtype=torch.bfloat16)
+
+    def resident_view(self, layer) -> ExpertView:
+        return ExpertView({
+            "gate_up": layer.gate_up_proj, "gate_up_scale": layer.gate_up_scale_inv,
+            "down": layer.down_proj, "down_scale": layer.down_scale_inv,
+        })
