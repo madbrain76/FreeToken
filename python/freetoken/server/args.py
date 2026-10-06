@@ -59,6 +59,7 @@ class ServerArgs(SchedulerConfig):
     # prompt_tokens_details.cached_tokens, Anthropic cache_read_input_tokens, Responses
     # input_tokens_details.cached_tokens). Mirrors sglang's --enable-cache-report.
     enable_cache_report: bool = False
+    anthropic_inline_system: str = "auto"
     # Comma-separated hostname allowlist for client-supplied image URLs; empty admits any domain.
     allowed_media_domains: str = ""
     # Directory file:// image refs may be read from; empty rejects local files.
@@ -575,6 +576,14 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--anthropic-inline-system",
+        choices=("auto", "preserve", "fold"),
+        default=ServerArgs.anthropic_inline_system,
+        help="Preserve inline system instructions when supported by the renderer, "
+        "or fold them into nearby user/tool content without hoisting the prompt prefix.",
+    )
+
+    parser.add_argument(
         "--sampling-defaults",
         type=str,
         default=ServerArgs.sampling_defaults,
@@ -639,8 +648,8 @@ def parse_args(
         choices=["auto", *MOE_STRATEGIES],
         help=(
             "How the routed experts are served. 'auto' resolves a MoE model to the offload family "
-            "(offload, or hybrid when a `ft bench bw` profile recommends it); resident "
-            "'fused' experts must be requested explicitly."
+            "(offload, or hybrid when a `ft bench bw` profile recommends it), and to resident "
+            "'fused' experts on unified-memory GPUs (GB10 / DGX Spark)."
         ),
     )
 
