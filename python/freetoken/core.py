@@ -74,6 +74,10 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    # Run-of-one-token breaker, driven by the scheduler drain (freetoken/storm.py):
+    # a stuck sample must end the request rather than stream to its output budget.
+    repeat_token: int = -1
+    repeat_run: int = 0
     output_token_counts: torch.Tensor | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:

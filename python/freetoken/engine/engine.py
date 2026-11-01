@@ -15,6 +15,8 @@ from freetoken.attention import AttnType, attention_backend_info, create_attenti
 from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from freetoken.gpu_select import gpu_identity
+from freetoken.env import ENV
+from freetoken.storm import nonfinite_rows
 from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
 from freetoken.layers import OffloadMoELayer, iter_moe_layers, set_rope_device
 from freetoken.layers.quantization import LayerKind, QuantBackend, QuantKind, finalize_quant, set_quant_backend
@@ -415,6 +417,9 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+    # Bool mask over the batch: rows whose logits were NaN/Inf, so the drain can fail
+    # them instead of shipping the token 0 such a row always samples. None when off.
+    nonfinite_cpu: torch.Tensor | None = None
 
 
 class Engine:
@@ -1587,11 +1592,13 @@ class Engine:
             req.complete_one()
 
         batch_logits = logits[: batch.size]
+        nonfinite = nonfinite_rows(batch_logits) if ENV.ABORT_ON_NONFINITE_LOGITS else None
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+        nonfinite_cpu = None if nonfinite is None else nonfinite.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, nonfinite_cpu)
 
     def _build_layer_major_chunks(self, batch: Batch) -> list:
         """Split one admitted long prefill into ordinary eager-forward shaped chunks."""

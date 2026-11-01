@@ -10,6 +10,7 @@ from freetoken.attention.linear import build_fla_metadata
 from freetoken.core import Batch, Req
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
+from freetoken.storm import note_repeated_token
 from freetoken.message import (
     AbortBackendMsg,
     BaseBackendMsg,
@@ -413,7 +414,7 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
 
-        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        batch, (_, next_tokens_cpu, copy_done, nonfinite_cpu) = last_data[0].batch, last_data[1]
         timeout = getattr(self.config, "step_timeout", None) or ENV.STEP_TIMEOUT.value
         self._wait_copy_done(copy_done, batch, timeout=timeout)
         reply: List[DetokenizeMsg] = []
@@ -450,6 +451,20 @@ class Scheduler(SchedulerIOMixin):
                     # client's terminal reply.
                     continue
                 next_token = next_tokens_cpu[i]
+                if nonfinite_cpu is not None and bool(nonfinite_cpu[i]):
+                    logger.error_rank0(
+                        f"req {req.uid}: non-finite logits at len {req.input_ids.numel()}, "
+                        "aborting instead of streaming the token 0 such a row samples"
+                    )
+                    reply.append(
+                        DetokenizeMsg(uid=req.uid, next_token=0, finished=True,
+                                      finish_reason="abort")
+                    )
+                    if req not in self.finished_reqs:
+                        self.decode_manager.remove_req(req)
+                        self._free_req_resources(req)
+                        new_finished_reqs.add(req)
+                    continue
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
@@ -470,6 +485,12 @@ class Scheduler(SchedulerIOMixin):
                     if finished
                     else None
                 )
+                if note_repeated_token(req, next_token, ENV.STORM_TOKEN_RUN.value):
+                    logger.error_rank0(
+                        f"req {req.uid}: token {next_token} repeated {req.repeat_run}x, "
+                        "aborting as a degenerate generation"
+                    )
+                    finished, finish_reason = True, "abort"
                 if (
                     next_token == self.toolcall_anchor_id
                     and req.toolcall_anchor_len is None
