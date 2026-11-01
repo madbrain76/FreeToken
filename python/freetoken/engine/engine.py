@@ -17,6 +17,7 @@ from freetoken.distributed import destroy_distributed, enable_pynccl_distributed
 from freetoken.gpu_select import gpu_identity
 from freetoken.env import ENV
 from freetoken.storm import nonfinite_rows
+from freetoken.storm import NonFiniteTracer
 from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
 from freetoken.layers import OffloadMoELayer, iter_moe_layers, set_rope_device
 from freetoken.layers.quantization import LayerKind, QuantBackend, QuantKind, finalize_quant, set_quant_backend
@@ -583,6 +584,8 @@ class Engine:
 
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
+        # Diagnostic only: unset NAN_TRACE leaves this None and the forward untouched.
+        self.nan_tracer = NonFiniteTracer(self.model, self.device) if ENV.NAN_TRACE else None
 
         post_free_memory = self._sync_get_memory()[0]
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
@@ -1576,6 +1579,8 @@ class Engine:
         assert torch.cuda.current_stream() == self.stream
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
+        if self.nan_tracer is not None:
+            self.nan_tracer.begin_step()
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
         if getattr(batch, "layer_major", False) and batch.is_prefill:
             with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, False):

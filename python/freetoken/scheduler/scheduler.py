@@ -452,8 +452,12 @@ class Scheduler(SchedulerIOMixin):
                     continue
                 next_token = next_tokens_cpu[i]
                 if nonfinite_cpu is not None and bool(nonfinite_cpu[i]):
+                    tracer = getattr(self.engine, "nan_tracer", None)
+                    where = tracer.describe() if tracer is not None else "NAN_TRACE off"
                     logger.error_rank0(
-                        f"req {req.uid}: non-finite logits at len {req.input_ids.numel()}, "
+                        f"req {req.uid}: non-finite logits at len {req.input_ids.numel()} "
+                        f"(batch={batch.size}, table={req.table_idx}, "
+                        f"linear_slot={req.linear_slot_idx}); first non-finite module: {where}; "
                         "aborting instead of streaming the token 0 such a row samples"
                     )
                     reply.append(

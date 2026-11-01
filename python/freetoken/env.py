@@ -78,6 +78,9 @@ class EnvClassSingleton:
     # streaming token 0 ("!") for its whole output budget. 0 disables the run check.
     ABORT_ON_NONFINITE_LOGITS = EnvBool(True)
     STORM_TOKEN_RUN = EnvInt(1024)
+    # Diagnostic: hook every layer module and name the first one whose output went
+    # non-finite, reported with the abort above. One reduction per layer per step.
+    NAN_TRACE = EnvBool(False)
     # GatedDeltaNet recurrent (SSM) state dtype: float32 (default) | bfloat16 | float16.
     # fp32 matches the Qwen3.x configs (mamba_ssm_dtype); fp16/bf16 halves the GDN state
     # pool at some precision cost on the long recurrence (mirrors SGLang's mamba_ssm_dtype).
