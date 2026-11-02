@@ -12,6 +12,24 @@ from freetoken.scheduler.cache import CacheManager
 class _Pool:
     """The real ``_return_slots`` guard over plain lists, without allocating a bank."""
 
+    # Device side, for CacheManager.check_integrity's GDN-slot bound: the tree holds no
+    # device snapshots in these fixtures, so all usable device slots read free.
+    num_slots = 32
+
+    @property
+    def num_free_slots(self):
+        return len(self._free_slots)
+
+    _num_host_slots = 32
+
+    @property
+    def num_host_slots(self):
+        return self._num_host_slots
+
+    @property
+    def num_free_host_slots(self):
+        return len(self._free_host_slots)
+
     def __init__(self, slots=8, held=(), held_state=()):
         self._free_slots = list(range(1, slots))
         self._free_host_slots = list(range(1, slots))
@@ -101,3 +119,80 @@ def test_state_slots_are_still_idempotent_through_the_same_path():
     CacheManager._free_req_slots(manager, req)
     assert manager.linear_state_pool.double_frees == 0
     assert sorted(manager.linear_state_pool._free_slots) == [1, 2, 3, 4, 5, 6, 7]
+
+
+class _Tree:
+    """The prefix-cache surface ``CacheManager.check_integrity`` reads."""
+
+    full_evictable = 0
+    full_protected = 0
+    mamba_evictable_size = 0
+    mamba_protected = 0
+
+    def __init__(self, host_nodes):
+        self.mamba_host_evictable = host_nodes
+        self.mamba_host_protected = 0
+
+    def check_integrity(self):
+        return None
+
+
+class _Probe:
+    """A hybrid cache manager over a bank of ``capacity`` slots, with ``free`` listed as
+    free and ``tree_host`` boundaries owned by the tree. Only the arithmetic the real
+    check cares about is modelled; the check itself is production code."""
+
+    is_hybrid = True
+    is_swa = False
+    page_size = 64
+    capacity = 31  # slot 0 is the reserved padding sink
+    # No KV pages in these fixtures, so the shared page tail of the check is satisfied.
+    num_pages = 0
+    free_slots = torch.zeros(0, dtype=torch.long)
+
+    def __init__(self, free, tree_host):
+        pool = _Pool(slots=32)
+        pool._free_host_slots = list(free)
+        pool._num_host_slots = self.capacity + 1
+        self.linear_state_pool = pool
+        self.prefix_cache = _Tree(tree_host)
+
+    check_integrity = CacheManager.check_integrity
+
+
+def test_a_stale_release_of_a_tree_owned_boundary_would_wedge_the_engine():
+    """The hang, in one test.
+
+    ``Scheduler.run_when_idle`` calls ``cache_manager.check_integrity()`` every time the
+    scheduler has nothing to do, and ``launch._run_scheduler`` catches only
+    ``KeyboardInterrupt`` -- so an AssertionError here kills that rank while its three
+    peers sit in a gloo/pynccl collective configured with ``--distributed-timeout
+    2592000`` (30 days, and ``use_pynccl`` defaults to True). Nothing errors; the
+    frontend's ``wait_for_ack`` has no timeout either, so every request hangs with no
+    response until the process is restarted.
+
+    The reachable sequence: the tree owns a boundary, one holder releases it, and a
+    sibling of the chunked-prefill chain releases the same slot again.
+    """
+    manager = _Probe(free=[7], tree_host=30)  # consistent: 1 free + 30 tree-owned == 31
+    manager.check_integrity()  # the idle check passes before the corruption
+
+    manager.linear_state_pool._free_host_slots.append(7)  # what the unguarded free_host did
+    import pytest
+
+    with pytest.raises(AssertionError, match="mamba bank leak"):
+        manager.check_integrity()
+
+
+def test_the_guard_lets_the_scheduler_survive_that_same_release():
+    import pytest
+
+    manager = _Probe(free=[7], tree_host=30)
+    manager.linear_state_pool.free_host(7)  # the stale sibling's release, via the guard
+    assert manager.linear_state_pool._free_host_slots == [7]
+    assert manager.linear_state_pool.double_frees == 1
+    manager.check_integrity()  # no AssertionError: the rank, and the engine, stay up
+
+    # A legitimate release is still honoured, guard intact.
+    manager.linear_state_pool.free_host(8)
+    assert manager.linear_state_pool._free_host_slots == [7, 8]
