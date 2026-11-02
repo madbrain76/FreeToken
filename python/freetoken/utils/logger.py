@@ -119,6 +119,7 @@ def init_logger(
             def warning_rank0(self, msg, *args, **kwargs): ...
             def debug_rank0(self, msg, *args, **kwargs): ...
             def critical_rank0(self, msg, *args, **kwargs): ...
+            def error_rank0(self, msg, *args, **kwargs): ...
 
         return WrapperLogger(name)
     else:
@@ -126,4 +127,10 @@ def init_logger(
         logger.debug_rank0 = partial(_call_rank0, _which="debug")
         logger.critical_rank0 = partial(_call_rank0, _which="critical")
         logger.warning_rank0 = partial(_call_rank0, _which="warning")
+        # ERROR was missing from this set while ``Scheduler._wait_copy_done``'s step-timeout
+        # branch already called ``logger.error_rank0``: a forward step that overran
+        # FREETOKEN_STEP_TIMEOUT raised AttributeError inside the handler, so the intended
+        # ErrorReplyMsgs never reached the clients and every scheduler rank died instead of
+        # dropping the batch. Bind the whole level set the callers expect.
+        logger.error_rank0 = partial(_call_rank0, _which="error")
         return logger
