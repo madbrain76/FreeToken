@@ -7,6 +7,9 @@ from freetoken.distributed import get_tp_info
 from freetoken.env import ENV
 from freetoken.models.config import LinearGatedDeltaGroupConfig, SlotStateSpec
 from freetoken.utils import div_even
+from freetoken.utils.logger import init_logger
+
+logger = init_logger(__name__)
 
 _SSM_DTYPES = {
     "float32": torch.float32,
@@ -106,6 +109,8 @@ class LinearStatePool:
         group = self._group
         self._num_host_slots = max(0, int(host_slots))
         self._free_host_slots: list[int] = list(range(1, self._num_host_slots))
+        # Times a slot was handed back while already on a free-list -- see _return_slots.
+        self.double_frees = 0
         self.host_conv_states: torch.Tensor | None = None
         self.host_recurrent_states: torch.Tensor | None = None
         self.host_slot_states: dict[str, torch.Tensor] = {}
@@ -206,13 +211,44 @@ class LinearStatePool:
         self._num_slots = num_slots
         self._free_slots = list(range(1, num_slots))
 
-    def free(self, slots) -> None:
-        """Return slot ids to the free-list. Accepts an int, list, or 1-D tensor."""
+    def _return_slots(self, slots, free_list: list[int], kind: str) -> None:
+        """Return slot ids to a free-list, refusing to list one slot twice.
+
+        A duplicate means two owners released the same state slot, so that slot had already
+        been handed to another request: for the pinned host bank, which holds a prefix's GDN
+        checkpoint, that means two boundaries sharing one recurrent-state buffer and a request
+        silently resuming another conversation's state. Owners are supposed to clear their
+        references (``CacheManager._free_req_slots``) and sentinel the request
+        (``table_idx == -1``), but the host track list is deliberately shared by identity down
+        a chunked prefill's Req chain, where clearing one holder's attribute is not enough.
+
+        Count and drop rather than raise: this runs in the scheduler, and a fault report that
+        takes serving down is worse than the fault.
+        """
         if isinstance(slots, torch.Tensor):
             slots = slots.flatten().tolist()
         elif isinstance(slots, int):
             slots = [slots]
-        self._free_slots.extend(int(s) for s in slots)
+        listed = set(free_list)
+        duplicates: list[int] = []
+        for slot in slots:
+            slot = int(slot)
+            if slot in listed:
+                duplicates.append(slot)
+                continue
+            listed.add(slot)
+            free_list.append(slot)
+        if duplicates:
+            self.double_frees += len(duplicates)
+            logger.warning_rank0(
+                f"mamba {kind} slot(s) {sorted(set(duplicates))} returned to the free-list "
+                f"while already free; dropped ({self.double_frees} double free(s) total). Two "
+                f"owners released the same {kind} slot, so it served two requests at once."
+            )
+
+    def free(self, slots) -> None:
+        """Return slot ids to the free-list. Accepts an int, list, or 1-D tensor."""
+        self._return_slots(slots, self._free_slots, "state")
 
     def clear_slots(self, slots) -> None:
         """Zero conv + recurrent state at ``slots`` across all linear layers (fresh sequence)."""
@@ -259,11 +295,7 @@ class LinearStatePool:
 
     def free_host(self, slots) -> None:
         """Return host slot ids to the bank free-list. Accepts an int, list, or 1-D tensor."""
-        if isinstance(slots, torch.Tensor):
-            slots = slots.flatten().tolist()
-        elif isinstance(slots, int):
-            slots = [slots]
-        self._free_host_slots.extend(int(s) for s in slots)
+        self._return_slots(slots, self._free_host_slots, "host bank")
 
     def reclaim_all_host_slots(self) -> None:
         """Idle-only, mirrors ``reclaim_all_slots``: the caller discards the tree that owned the

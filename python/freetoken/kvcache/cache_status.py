@@ -145,6 +145,7 @@ def compute_cache_pools(engine: "Engine") -> Dict[str, int]:
     pools = {
         "num_pages": 0, "page_size": 0, "moe_cache_size": 0, "num_mamba_slots": 0,
         "swa_page_size": 0, "num_swa_pages": 0,
+        "mamba_host_slots": 0, "mamba_host_used": 0, "mamba_host_double_frees": 0,
     }
     try:
         config = engine.config
@@ -161,6 +162,16 @@ def compute_cache_pools(engine: "Engine") -> Dict[str, int]:
         lsp = engine.linear_state_pool
         if lsp is not None:
             pools["num_mamba_slots"] = max(0, int(lsp.num_slots or 0) - 1)
+            # The pinned host bank is where GDN checkpoints live between turns. It has no
+            # device-level gauge, so a bank that has silently saturated -- every long prompt
+            # evicting another conversation's resume point -- is invisible without this.
+            # Slot 0 is the reserved padding sink, matching num_mamba_slots above.
+            host_total = max(0, int(getattr(lsp, "num_host_slots", 0) or 0) - 1)
+            pools["mamba_host_slots"] = host_total
+            pools["mamba_host_used"] = max(
+                0, host_total - int(getattr(lsp, "num_free_host_slots", 0) or 0)
+            )
+            pools["mamba_host_double_frees"] = int(getattr(lsp, "double_frees", 0) or 0)
     except Exception:  # noqa: BLE001 -- best-effort; readiness must not depend on this
         pass
     return pools

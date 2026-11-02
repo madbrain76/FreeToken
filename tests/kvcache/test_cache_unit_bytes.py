@@ -259,7 +259,9 @@ def test_compute_cache_pools_reads_load_time_allocations():
         ),
         moe_offload_cache=SimpleNamespace(cache_size=526, bank_caches={}),
         # num_slots includes the reserved padding sink; API units are usable slots.
-        linear_state_pool=SimpleNamespace(num_slots=65),
+        linear_state_pool=SimpleNamespace(
+            num_slots=65, num_host_slots=33, num_free_host_slots=3, double_frees=1
+        ),
     )
     assert compute_cache_pools(eng) == {
         "num_pages": 90112,
@@ -268,6 +270,11 @@ def test_compute_cache_pools_reads_load_time_allocations():
         "num_mamba_slots": 64,
         "swa_page_size": 0,
         "num_swa_pages": 0,
+        # Same padding-sink convention on the pinned host bank, so a full bank reads
+        # used == total; double_frees is the aliasing counter (see _return_slots).
+        "mamba_host_slots": 32,
+        "mamba_host_used": 29,
+        "mamba_host_double_frees": 1,
     }
 
 
@@ -282,6 +289,9 @@ def test_compute_cache_pools_zero_for_missing_pools():
         "num_mamba_slots": 0,
         "swa_page_size": 0,
         "num_swa_pages": 0,
+        "mamba_host_slots": 0,
+        "mamba_host_used": 0,
+        "mamba_host_double_frees": 0,
     }
 
 

@@ -599,7 +599,14 @@ class CacheManager:
         # Chunk boundaries the final commit never managed to attach (aborted prefill, or the
         # tokens left the tree): the bank slot is the request's to return, not the tree's.
         if req.mamba_host_tracks:
-            self.linear_state_pool.free_host([h for _, h in req.mamba_host_tracks])
+            tracks = req.mamba_host_tracks
+            req.mamba_host_tracks = None
+            self.linear_state_pool.free_host([h for _, h in tracks])
+            # Clear the shared list, not just this holder's attribute: overlap scheduling
+            # builds the next chunk's Req from this one's list by identity (see
+            # PrefillManager._add_one_req), so a sibling still points at the same object.
+            # Emptying it makes a second release a no-op instead of a double free.
+            tracks.clear()
         req.mamba_host_tracks = None
 
     def check_integrity(self) -> None:
