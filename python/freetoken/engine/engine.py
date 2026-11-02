@@ -16,7 +16,7 @@ from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from freetoken.gpu_select import gpu_identity
 from freetoken.env import ENV
-from freetoken.storm import nonfinite_rows
+from freetoken.storm import row_fault_counts
 from freetoken.storm import NonFiniteTracer
 from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
 from freetoken.layers import OffloadMoELayer, iter_moe_layers, set_rope_device
@@ -418,9 +418,14 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
-    # Bool mask over the batch: rows whose logits were NaN/Inf, so the drain can fail
-    # them instead of shipping the token 0 such a row always samples. None when off.
-    nonfinite_cpu: torch.Tensor | None = None
+    # Per-row NaN/+Inf/-Inf/finite logits counts, so the drain can fail a row instead of
+    # shipping the token 0 such a row always samples. None when the breaker is off.
+    fault_counts_cpu: torch.Tensor | None = None
+    # The counts' device side, carried for the same reason as ``next_tokens_gpu``: the
+    # host copy is enqueued on ``self.stream`` and only complete once the event is, so
+    # the source has to stay referenced until then or the caching allocator can hand its
+    # block to the next allocation.
+    fault_counts_gpu: torch.Tensor | None = None
 
 
 class Engine:
@@ -1597,13 +1602,23 @@ class Engine:
             req.complete_one()
 
         batch_logits = logits[: batch.size]
-        nonfinite = nonfinite_rows(batch_logits) if ENV.ABORT_ON_NONFINITE_LOGITS else None
+        fault_counts = (
+            row_fault_counts(batch_logits) if ENV.ABORT_ON_NONFINITE_LOGITS else None
+        )
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
-        nonfinite_cpu = None if nonfinite is None else nonfinite.to("cpu", non_blocking=True)
+        fault_counts_cpu = (
+            None if fault_counts is None else fault_counts.to("cpu", non_blocking=True)
+        )
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, nonfinite_cpu)
+        return ForwardOutput(
+            next_tokens_gpu,
+            next_tokens_cpu,
+            copy_done_event,
+            fault_counts_cpu,
+            fault_counts,
+        )
 
     def _build_layer_major_chunks(self, batch: Batch) -> list:
         """Split one admitted long prefill into ordinary eager-forward shaped chunks."""

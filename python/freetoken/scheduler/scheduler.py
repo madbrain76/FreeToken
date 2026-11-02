@@ -10,7 +10,7 @@ from freetoken.attention.linear import build_fla_metadata
 from freetoken.core import Batch, Req
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
-from freetoken.storm import note_repeated_token
+from freetoken.storm import note_repeated_token, record_storm_event, row_fault
 from freetoken.message import (
     AbortBackendMsg,
     BaseBackendMsg,
@@ -414,10 +414,17 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
 
-        batch, (_, next_tokens_cpu, copy_done, nonfinite_cpu) = last_data[0].batch, last_data[1]
+        batch, (
+            _,
+            next_tokens_cpu,
+            copy_done,
+            fault_counts_cpu,
+            _,
+        ) = last_data[0].batch, last_data[1]
         timeout = getattr(self.config, "step_timeout", None) or ENV.STEP_TIMEOUT.value
         self._wait_copy_done(copy_done, batch, timeout=timeout)
         reply: List[DetokenizeMsg] = []
+        error_replies: List[ErrorReplyMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
@@ -451,18 +458,21 @@ class Scheduler(SchedulerIOMixin):
                     # client's terminal reply.
                     continue
                 next_token = next_tokens_cpu[i]
-                if nonfinite_cpu is not None and bool(nonfinite_cpu[i]):
-                    tracer = getattr(self.engine, "nan_tracer", None)
-                    where = tracer.describe() if tracer is not None else "NAN_TRACE off"
-                    logger.error_rank0(
-                        f"req {req.uid}: non-finite logits at len {req.input_ids.numel()} "
-                        f"(batch={batch.size}, table={req.table_idx}, "
-                        f"linear_slot={req.linear_slot_idx}); first non-finite module: {where}; "
-                        "aborting instead of streaming the token 0 such a row samples"
-                    )
-                    reply.append(
-                        DetokenizeMsg(uid=req.uid, next_token=0, finished=True,
-                                      finish_reason="abort")
+                fault = (
+                    row_fault(fault_counts_cpu[i]) if fault_counts_cpu is not None else None
+                )
+                if fault is not None and fault.is_fault:
+                    # The sampler cannot tell such a row from a healthy one: argmax answers
+                    # index 0 and the inverse-CDF draw leaves its zero-filled out untouched,
+                    # so this request would stream token 0 ("!") to its output budget.
+                    error_replies.append(
+                        self._degenerate_generation_reply(
+                            req,
+                            batch,
+                            code="nonfinite_logits",
+                            detail=f"non-finite logits ({fault.describe()}) at length "
+                            f"{req.input_ids.numel()}",
+                        )
                     )
                     if req not in self.finished_reqs:
                         self.decode_manager.remove_req(req)
@@ -490,11 +500,22 @@ class Scheduler(SchedulerIOMixin):
                     else None
                 )
                 if note_repeated_token(req, next_token, ENV.STORM_TOKEN_RUN.value):
-                    logger.error_rank0(
-                        f"req {req.uid}: token {next_token} repeated {req.repeat_run}x, "
-                        "aborting as a degenerate generation"
+                    # The backstop for a collapse that stayed finite. No terminal token
+                    # reply: the client has already been streamed the run, so the request
+                    # ends as an error rather than as a completion of nonsense.
+                    error_replies.append(
+                        self._degenerate_generation_reply(
+                            req,
+                            batch,
+                            code="degenerate_repeat",
+                            detail=f"token {next_token} repeated {req.repeat_run}x in a row",
+                        )
                     )
-                    finished, finish_reason = True, "abort"
+                    if req not in self.finished_reqs:
+                        self.decode_manager.remove_req(req)
+                        self._free_req_resources(req)
+                        new_finished_reqs.add(req)
+                    continue
                 if (
                     next_token == self.toolcall_anchor_id
                     and req.toolcall_anchor_len is None
@@ -557,6 +578,71 @@ class Scheduler(SchedulerIOMixin):
             swa_tokens=swa_tokens,
         )
         self.send_result(reply)
+        if error_replies:
+            self.send_result(error_replies)
+
+    def _degenerate_generation_reply(
+        self, req: Req, batch: Batch, *, code: str, detail: str
+    ) -> ErrorReplyMsg:
+        """Report one breaker trip and build the request's terminal error reply.
+
+        Nothing in here may raise. It runs in the drain of a live TP4 step, and an
+        exception escaping it takes down every scheduler rank and with them the API
+        server -- a fault report that costs more than the request it reports is worse
+        than the fault. Evidence therefore goes to the event log *before* the log call:
+        a pane's scrollback is not evidence, and the first trip ever lost its report to
+        an ``AttributeError`` raised by the logging call itself.
+        """
+        uid = int(req.uid)
+        where = "NAN_TRACE off"
+        try:
+            tracer = getattr(self.engine, "nan_tracer", None)
+            if tracer is not None:
+                where = tracer.describe()
+        except Exception as e:
+            where = f"tracer unavailable ({type(e).__name__}: {e})"
+        padded = getattr(batch, "padded_reqs", None)
+        try:
+            record = {
+                "event": code,
+                "uid": uid,
+                "detail": detail,
+                "tokens": int(req.input_ids.numel()),
+                "phase": "prefill" if batch.is_prefill else "decode",
+                "batch": int(batch.size),
+                "padded_batch": int(len(padded)) if padded is not None else -1,
+                "layer_major": bool(getattr(batch, "layer_major", False)),
+                "table_idx": int(req.table_idx),
+                "linear_slot": int(getattr(req, "linear_slot_idx", -1) or -1),
+                "first_nonfinite_module": where,
+            }
+        except Exception as e:
+            record = {"event": code, "uid": uid, "detail": detail, "context_error": repr(e)}
+        try:
+            record_storm_event(ENV.STORM_EVENT_LOG.value, record)
+        except Exception as e:
+            logger.warning(f"Could not record the breaker trip for req {uid}: {e!r}")
+        message = (
+            f"req {uid}: {detail}; first non-finite module: {where}; aborting the request "
+            "instead of streaming a continuation that cannot become useful "
+            "(FREETOKEN_ABORT_ON_NONFINITE_LOGITS=0 / FREETOKEN_STORM_TOKEN_RUN=0 disable)"
+        )
+        try:
+            logger.error_rank0(message)
+        except Exception:
+            try:
+                logger.warning(f"[rank0] {message}")
+            except Exception:
+                pass
+        return ErrorReplyMsg(
+            uid=uid,
+            error=(
+                f"FreeToken aborted this request: {detail}. The continuation could not have "
+                "become useful, and the sampler cannot distinguish such a row from a healthy "
+                "one, so it was failed rather than streamed."
+            ),
+            code=code,
+        )
 
     def _match_stop_str(self, req: Req) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes

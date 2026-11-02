@@ -78,6 +78,9 @@ class EnvClassSingleton:
     # streaming token 0 ("!") for its whole output budget. 0 disables the run check.
     ABORT_ON_NONFINITE_LOGITS = EnvBool(True)
     STORM_TOKEN_RUN = EnvInt(1024)
+    # Append-only JSONL record of every fault the breakers raise, so the evidence survives
+    # a lost terminal. Empty disables the file and leaves logging as the only channel.
+    STORM_EVENT_LOG = EnvStr("~/.freetoken/storm-events.jsonl")
     # Diagnostic: hook every layer module and name the first one whose output went
     # non-finite, reported with the abort above. One reduction per layer per step.
     NAN_TRACE = EnvBool(False)

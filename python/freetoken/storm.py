@@ -12,17 +12,109 @@ coordinator rather than serving stale experts.
 
 from __future__ import annotations
 
+import json
+import os
 import re
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 import torch
 
 _LAYER_NAME = re.compile(r"(?:^|\.)layers\.\d+$")
 
 
-def nonfinite_rows(logits: torch.Tensor) -> torch.Tensor:
-    """Bool mask over the batch: rows holding at least one NaN or Inf logit."""
-    return ~torch.isfinite(logits).all(dim=-1)
+class RowFault(NamedTuple):
+    """What was wrong with one logits row, counted before it is failed.
+
+    The split between NaN and +/-Inf is what names the producing stage: a NaN says an
+    invalid arithmetic operation happened (a 0/0 softmax normalizer, an accumulator
+    seeded from uninitialized memory), an Inf says a value overflowed its dtype. The
+    counts are taken on the device for every row of every step and copied to the host
+    beside the sampled tokens, so the drain reads them without a synchronization and
+    while they still describe the step that produced them.
+    """
+
+    n_nan: int
+    n_posinf: int
+    n_neginf: int
+    n_finite: int
+
+    @property
+    def n_nonfinite(self) -> int:
+        return self.n_nan + self.n_posinf + self.n_neginf
+
+    @property
+    def n_total(self) -> int:
+        return self.n_nonfinite + self.n_finite
+
+    @property
+    def is_fault(self) -> bool:
+        return self.n_nonfinite > 0
+
+    @property
+    def all_nonfinite(self) -> bool:
+        return self.n_finite == 0 and self.n_nonfinite > 0
+
+    def describe(self) -> str:
+        kinds = ", ".join(
+            f"{n} {name}"
+            for name, n in (("NaN", self.n_nan), ("+Inf", self.n_posinf), ("-Inf", self.n_neginf))
+            if n
+        )
+        return (
+            f"{kinds or 'no non-finite'} of {self.n_total} logits, "
+            f"{self.n_finite} finite"
+            + (", row wholly non-finite" if self.all_nonfinite else "")
+        )
+
+
+def row_fault_counts(logits: torch.Tensor) -> torch.Tensor:
+    """int32 ``(batch, 4)`` per-row counts of NaN, +Inf, -Inf and finite logits.
+
+    Four reductions over the batch's logits -- a fraction of a millisecond a step and no
+    host synchronization -- which is what lets the breaker stay on by default.
+    """
+    return torch.stack(
+        [
+            torch.isnan(logits).sum(dim=-1),
+            torch.isposinf(logits).sum(dim=-1),
+            torch.isneginf(logits).sum(dim=-1),
+            torch.isfinite(logits).sum(dim=-1),
+        ],
+        dim=-1,
+    ).to(torch.int32)
+
+
+def row_fault(counts_row: torch.Tensor) -> RowFault | None:
+    """Rebuild one row's :class:`RowFault`; None if the counts cannot be read.
+
+    Diagnostics must never be able to take serving down, so a failure to interpret the
+    counts degrades to a missing description instead of an exception out of the drain.
+    """
+    try:
+        n_nan, n_posinf, n_neginf, n_finite = (int(c) for c in counts_row.reshape(-1))
+        return RowFault(n_nan, n_posinf, n_neginf, n_finite)
+    except Exception:
+        return None
+
+
+def record_storm_event(path: str, payload: dict) -> bool:
+    """Append one fault record to ``path``; report whether it landed.
+
+    The scheduler logs to a terminal, and a pane's scrollback is not evidence: the run
+    that first caught a non-finite row lost its report to an ``AttributeError`` raised by
+    the logging call itself. Writing the record out first means the finding survives
+    whatever the logger does afterwards.
+    """
+    if not path:
+        return False
+    try:
+        expanded = os.path.expanduser(path)
+        os.makedirs(os.path.dirname(expanded) or ".", exist_ok=True)
+        with open(expanded, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
+        return True
+    except Exception:
+        return False
 
 
 class RepeatState(Protocol):
