@@ -6,6 +6,7 @@ import pathlib
 import re
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -17,6 +18,19 @@ from freetoken.storm import (
     row_fault,
     row_fault_counts,
 )
+
+
+@pytest.fixture(autouse=True)
+def _keep_test_trips_out_of_the_operator_log(tmp_path, monkeypatch):
+    """``FREETOKEN_STORM_EVENT_LOG`` defaults to a real operator file.
+
+    Every drain test below trips a breaker, and those records would otherwise pile up in
+    ``~/.freetoken/storm-events.jsonl`` looking exactly like production evidence to the
+    next person who reads it.
+    """
+    from freetoken.env import ENV
+
+    monkeypatch.setattr(ENV.STORM_EVENT_LOG, "value", str(tmp_path / "storm-events.jsonl"))
 
 
 def _req():
