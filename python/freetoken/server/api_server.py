@@ -19,6 +19,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from freetoken import __version__
 from freetoken.core import SamplingParams
+from freetoken.env import ENV
 from freetoken.message import (
     AbortMsg,
     BaseFrontendMsg,
@@ -60,6 +61,12 @@ _MODEL_SAMPLING: Dict[str, Any] = {}
 # shutdown is treated as expected — no ERROR log, no "failed" latch. See run_backend_supervisor.
 _SHUTTING_DOWN = threading.Event()
 BACKEND_DEATH_EXIT_GRACE_S = 10.0
+# How much longer to wait for uvicorn's graceful drain after that SIGTERM before forcing the
+# process down. The drain waits on exactly the connections whose backend is gone, so without
+# this bound a dead worker leaves the serve sitting in "Waiting for connections to close"
+# indefinitely -- which is what "the server stopped answering and only a restart fixed it"
+# looks like from the client side.
+BACKEND_DEATH_FORCE_GRACE_S = 30.0
 
 
 def get_global_state() -> FrontendManager:
@@ -87,16 +94,42 @@ def _terminate_backend_workers(processes: List[Any]) -> None:
             continue
 
 
-def _exit_after_backend_death(grace_s: float) -> threading.Timer:
+def _exit_after_backend_death(
+    grace_s: float, force_grace_s: float = BACKEND_DEATH_FORCE_GRACE_S
+) -> threading.Timer:
+    # Whether THIS path sent the SIGTERM. Deliberately not _SHUTTING_DOWN: that flag is set
+    # by the signal handler the SIGTERM triggers, so gating the escalation on it would skip
+    # the only case it exists for (our own shutdown stalling in the connection drain).
+    terminated = threading.Event()
+
     def _stop() -> None:
         if _SHUTTING_DOWN.is_set():
             return  # an external stop got here first
         logger.error("Backend worker is gone and cannot be restarted; stopping the API server")
+        terminated.set()
         os.kill(os.getpid(), signal.SIGTERM)
+
+    def _force() -> None:
+        if not terminated.is_set():
+            return  # an external stop owns this shutdown; its drain may be legitimate
+        logger.error(
+            f"API server is still up {force_grace_s:.0f}s after the post-death SIGTERM; "
+            "forcing shutdown"
+        )
+        # Take the workers with us: a rank blocked in a collective allowed to run for
+        # DISTRIBUTED_TIMEOUT would otherwise outlive the API and keep the GPUs held.
+        processes = list(getattr(_GLOBAL_STATE, "backend_processes", None) or [])
+        _terminate_backend_workers(processes)
+        _reap_backend_workers(processes)
+        os.kill(os.getpid(), signal.SIGKILL)
 
     timer = threading.Timer(grace_s, _stop)
     timer.daemon = True
     timer.start()
+    if force_grace_s > 0:
+        forced = threading.Timer(grace_s + force_grace_s, _force)
+        forced.daemon = True
+        forced.start()
     return timer
 
 
@@ -112,6 +145,19 @@ def _reap_backend_workers(processes: List[Any], timeout: float = 5.0) -> None:
                 p.kill()
         except Exception:  # noqa: BLE001 -- already-gone / unqueryable handle: nothing to do
             continue
+
+
+def _terminal_error_reply(uid: int, error: str, code: str) -> UserReply:
+    """A reply that ends a request the engine is never going to answer.
+
+    Shaped exactly like the detokenizer's own error replies (``UserReply(error=..., n=code)``),
+    so the existing ``if getattr(ack, "error", None): raise GenerationError`` handling in every
+    API adapter applies and a client gets a machine-readable code instead of waiting forever
+    for a terminal ack that a dead backend will not send.
+    """
+    return UserReply(
+        uid=uid, incremental_output="", finished=True, error=error, error_code=code
+    )
 
 
 def _unwrap_msg(msg: BaseFrontendMsg) -> List[UserReply]:
@@ -318,6 +364,35 @@ class FrontendManager:
             # Loop already closed (shutdown racing the crash): nothing left to wake.
             pass
 
+    def fail_admitted_requests(self, message: str, code: str = "backend_gone") -> None:
+        """Wake every admitted request with a terminal error, because the engine is gone.
+
+        The generation path had no equivalent of ``fail_pending_rebuilds``: a request parked
+        in ``wait_for_ack`` only returns once an ack with ``finished`` arrives, and after a
+        worker death none ever does. The clients of a half-dead server therefore hung -- and
+        uvicorn's graceful drain after the post-death SIGTERM waits on those very
+        connections, so the whole serve lingered until someone hit Ctrl-C. Same
+        call_soon_threadsafe discipline as ``fail_pending_rebuilds``: this is called from the
+        supervisor thread, and ``asyncio.Event`` is not thread-safe.
+        """
+        loop = self._loop
+        if loop is None:
+            return  # listener never started -> nothing could be admitted
+
+        def _fail_all() -> None:
+            for uid in list(self.ack_map):
+                self.ack_map.setdefault(uid, []).append(
+                    _terminal_error_reply(uid, message, code)
+                )
+                event = self.event_map.get(uid)
+                if event is not None:
+                    event.set()
+
+        try:
+            loop.call_soon_threadsafe(_fail_all)
+        except RuntimeError:
+            pass  # loop already closed (shutdown racing the crash)
+
     def _create_listener_once(self):
         if not self.initialized:
             self._loop = asyncio.get_running_loop()
@@ -334,9 +409,31 @@ class FrontendManager:
         # the terminal ack, leaving this generator suspended at the yield. Cleanup written
         # after the loop would then only run on paths nobody takes, leaking both maps once
         # per completed request. GeneratorExit runs the finally.
+        idle = ENV.ACK_IDLE_TIMEOUT.value
         try:
             while True:
-                await event.wait()
+                if idle > 0:
+                    try:
+                        await asyncio.wait_for(event.wait(), timeout=idle)
+                    except asyncio.TimeoutError:
+                        # Nothing has come back for `idle` seconds. If a TP rank died the
+                        # survivors are blocked in a collective allowed to run for
+                        # DISTRIBUTED_TIMEOUT (30 days as launched), so "keep waiting" is not
+                        # a neutral choice -- it is the hang. Fail this request instead.
+                        logger.error(
+                            f"req {uid}: the engine produced no ack for {idle:.0f}s; failing "
+                            "the request instead of waiting forever"
+                        )
+                        yield _terminal_error_reply(
+                            uid,
+                            f"FreeToken returned no output for {idle:.0f}s; the engine is "
+                            "wedged or a worker died. Retry, and restart the server if it "
+                            "persists.",
+                            "backend_silent",
+                        )
+                        return
+                else:
+                    await event.wait()
                 event.clear()
 
                 pending = self.ack_map[uid]
@@ -1043,6 +1140,11 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         # No CacheRebuildReply will ever arrive from a dead backend, so wake any caller blocked
         # in dispatch_rebuild's await now — otherwise it strands until the full rebuild timeout.
         _GLOBAL_STATE.fail_pending_rebuilds(message)
+        # ... and the same for generation: parked requests would otherwise hang through the
+        # shutdown, keeping the connection drain (and so the process) alive indefinitely.
+        _GLOBAL_STATE.fail_admitted_requests(
+            f"FreeToken backend died: {message}. The request was never answered."
+        )
         # Then take the whole serve down (see _exit_after_backend_death). Shell mode is excluded:
         # a person is sitting at that TUI, the API is theirs alone, and its stop path is ^C.
         if not run_shell:

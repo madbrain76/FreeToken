@@ -73,6 +73,12 @@ class EnvClassSingleton:
     PYNCCL_MAX_BUFFER_SIZE = EnvMem(1024**3)
     STEP_TIMEOUT = EnvFloat(120.0)
     DISTRIBUTED_TIMEOUT = EnvFloat(2592000.0)
+    # Fail a request whose engine has gone silent, so a wedged backend cannot strand the
+    # client forever: the surviving TP ranks sit in a collective allowed to run for
+    # DISTRIBUTED_TIMEOUT (30 days) and no ack ever arrives. Measured between acks, not
+    # end to end, so a queued request is only at risk if the whole engine stalls. 0
+    # disables the breaker and restores the wait-forever behaviour.
+    ACK_IDLE_TIMEOUT = EnvFloat(900.0)
     # Degenerate-generation breakers (freetoken/storm.py): fail a request whose logits
     # went non-finite, or that repeats one token this many times in a row, instead of
     # streaming token 0 ("!") for its whole output budget. 0 disables the run check.
