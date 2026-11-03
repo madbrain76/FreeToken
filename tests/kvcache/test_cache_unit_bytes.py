@@ -302,3 +302,59 @@ def test_status_meta_includes_pools():
     meta = compute_cache_status_meta(eng)
     assert meta["pools"]["num_pages"] == 100
     assert meta["pools"]["page_size"] == 16
+
+
+def _bank_state(**pools):
+    base = {
+        "num_pages": 8192,
+        "page_size": 64,
+        "moe_cache_size": 9400,
+        "num_mamba_slots": 24,
+        "swa_page_size": 0,
+        "num_swa_pages": 0,
+    }
+    base.update(pools)
+    return SimpleNamespace(
+        stats=SimpleNamespace(kv_total_pages=8192, mamba_total_slots=24),
+        config=SimpleNamespace(
+            page_size=64,
+            model_config=SimpleNamespace(num_experts=512, num_moe_layers=48),
+            moe_cache_policy="lru",
+        ),
+        last_rebuild={"moe_cache_size": 9400},
+        cache_pools=base,
+        swa_full_tokens_ratio=0.0,
+        unit_bytes={},
+        cache_budget_bytes=0,
+        free_vram_bytes=0,
+        cache_floors={},
+    )
+
+
+def test_cache_geometry_surfaces_the_host_bank_gauges():
+    # Regression guard: compute_cache_pools put the bank on the wire while
+    # /v1/cache/status geometry omitted it, leaving the saturation and aliasing
+    # counters this deployment depends on unobservable.
+    from freetoken.server import api_server
+
+    geo = api_server.cache_geometry(
+        _bank_state(
+            mamba_host_slots=31,
+            mamba_host_used=31,
+            mamba_host_double_frees=2,
+        )
+    )
+
+    assert geo["mamba_host_slots"] == 31
+    assert geo["mamba_host_used"] == 31
+    assert geo["mamba_host_double_frees"] == 2
+
+
+def test_cache_geometry_zeroes_a_bank_the_engine_never_reported():
+    from freetoken.server import api_server
+
+    geo = api_server.cache_geometry(_bank_state())
+
+    assert geo["mamba_host_slots"] == 0
+    assert geo["mamba_host_used"] == 0
+    assert geo["mamba_host_double_frees"] == 0

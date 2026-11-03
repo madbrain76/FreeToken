@@ -931,6 +931,14 @@ def cache_geometry(state: Any) -> dict:
         # Concrete current window size in that unit (usable pages): the last rebuild's value if it
         # pinned/derived one, else the load-time pool size. 0 for models without a window pool.
         "num_swa_pages": int(last.get("num_swa_pages") or pools.get("num_swa_pages", 0) or 0),
+        # The pinned GDN host bank, straight from the load-time pool allocation: a bank
+        # that saturated, or that handed one checkpoint buffer to two boundaries, is
+        # otherwise invisible over the API. 0 for models without a host bank.
+        "mamba_host_slots": int(pools.get("mamba_host_slots", 0) or 0),
+        "mamba_host_used": int(pools.get("mamba_host_used", 0) or 0),
+        "mamba_host_double_frees": int(
+            pools.get("mamba_host_double_frees", 0) or 0
+        ),
         # Engine's exact total cache VRAM budget (all pools), from the ("meta", …) ack. 0 when
         # unknown (pre-budget engine) — the desktop then reverse-derives it from the limits.
         "cache_budget_bytes": int(getattr(state, "cache_budget_bytes", 0) or 0),
