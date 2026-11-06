@@ -217,7 +217,7 @@ def test_adjust_config_resolves_num_tokens_generic():
         cuda_graph_bs = [1, 2]
         max_seq_len = 1024
         page_size = 1
-        attention_backend = "fi"
+        attention_backend = "triton" if torch.version.hip is not None else "fi"
         num_page_override = None
         num_token_override = 5000
 
@@ -354,7 +354,7 @@ def _offload_engine_config(**overrides):
         model_path="/tmp/freetoken-test-model",
         tp_info=DistributedInfo(rank=0, size=1),
         dtype=torch.bfloat16,
-        attention_backend="fi",
+        attention_backend="triton" if torch.version.hip is not None else "fi",
         **overrides,
     )
     object.__setattr__(
@@ -569,7 +569,14 @@ def test_moe_pool_flags_and_decode_batch_clamp():
     # GPU decode needs batch * top_k distinct experts to fit the smallest pool below num_experts
     config = SimpleNamespace(
         model_config=SimpleNamespace(num_experts=16, num_experts_per_tok=4),
-        max_running_req=4, cuda_graph_max_bs=None, cuda_graph_bs=[1, 2, 4],
+        max_running_req=4, cuda_graph_max_bs=None, cuda_graph_bs=[1, 2, 4], decode_rows_per_req=1,
     )
     _clamp_decode_batch_to_pools(config, [12, 16, 9])
     assert (config.max_running_req, config.cuda_graph_max_bs, config.cuda_graph_bs) == (2, 2, [1, 2])
+    # two rows per request route twice the experts: 9 // (4 * 2) leaves one request
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(num_experts=16, num_experts_per_tok=4),
+        max_running_req=4, cuda_graph_max_bs=None, cuda_graph_bs=[1, 2, 4], decode_rows_per_req=2,
+    )
+    _clamp_decode_batch_to_pools(config, [12, 16, 9])
+    assert (config.max_running_req, config.cuda_graph_max_bs, config.cuda_graph_bs) == (1, 1, [1])

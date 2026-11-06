@@ -28,6 +28,12 @@ def _pool(num_slots=8, device="cpu", slot_states=()):
                            device=torch.device(device), tp_size=1, slot_states=slot_states)
 
 
+def _bank_pool(num_slots=8, host_slots=4, slot_states=()):
+    return LinearStatePool(group=_group(), num_slots=num_slots, dtype=torch.bfloat16,
+                           device=torch.device("cpu"), tp_size=1, slot_states=slot_states,
+                           host_slots=host_slots)
+
+
 def test_alloc_free_roundtrip():
     pool = _pool(num_slots=8)
     assert pool.num_free_slots == 7          # slots 1..7 (slot 0 = padding)
@@ -127,6 +133,36 @@ def test_layerless_spec_dtype_and_fill_value():
 def test_duplicate_names_rejected():
     with pytest.raises(ValueError, match="duplicate"):
         _pool(slot_states=_SPECS + _SPECS)
+
+
+def test_clear_host_resets_a_bank_slot_to_its_fill_value():
+    """A checkpoint archived from a faulted request is restorable by a later one."""
+    spec = SlotStateSpec(name="ngram", shape=(2,), dtype=torch.int32, fill_value=7.0)
+    pool = _bank_pool(slot_states=(spec,))
+    dirty, clean = pool.alloc_host(2)
+    for t in (pool.host_conv_states, pool.host_recurrent_states):
+        t[:, [dirty, clean]] = float("nan")
+    pool.host_slot_states["ngram"][:, dirty] = 1
+    assert bool(torch.isnan(pool.host_conv_states[:, clean]).any())
+
+    pool.clear_host([dirty])
+
+    assert not bool(torch.isnan(pool.host_conv_states[:, dirty]).any())
+    assert not bool(torch.isnan(pool.host_recurrent_states[:, dirty]).any())
+    assert bool((pool.host_slot_states["ngram"][:, dirty] == 7).all())
+    # only the named slot is wiped: the neighbour keeps its poison
+    assert bool(torch.isnan(pool.host_conv_states[:, clean]).any())
+
+
+def test_clear_host_tolerates_the_shapes_free_host_does():
+    pool = _bank_pool()
+    a, b = pool.alloc_host(2)
+    pool.host_recurrent_states[:, a] = 4.0
+    pool.clear_host(a)                                    # an int
+    pool.host_recurrent_states[:, b] = 4.0
+    pool.clear_host(torch.tensor([b], dtype=torch.long))  # a tensor
+    pool.clear_host([])                                   # and nothing at all
+    assert float(pool.host_recurrent_states.abs().sum()) == 0.0
 
 
 def test_slot_state_follows_every_slot_operation():

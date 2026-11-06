@@ -422,7 +422,7 @@ class Qwen3ReasoningParser(ThinkReasoningParser):
     """Qwen3 reasoning with recovery for an omitted ``</think>`` before XML tools.
 
     Qwen's chat template starts generation inside ``<think>`` and asks for
-    ``<tool_call>`` XML.  Models occasionally transition directly to that block.
+    ``<tool_call>`` XML. Models occasionally transition directly to that block.
     Preserve the block for the Qwen tool-call parser, which still decides whether
     it is a valid structured call.
     """
@@ -897,6 +897,7 @@ class ReasoningParser:
     """Wraps a reasoning detector for streaming and non-streaming use."""
 
     ReasoningParserEnum: Dict[str, Type[BaseReasoningParser]] = {
+        "flint": ThinkReasoningParser,
         "deepseekv32": DeepSeekV32ReasoningParser,
         "gpt_oss": GptOssHarmonyReasoningParser,
         "qwen3": Qwen3ReasoningParser,

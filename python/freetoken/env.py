@@ -87,6 +87,19 @@ class EnvClassSingleton:
     # Append-only JSONL record of every fault the breakers raise, so the evidence survives
     # a lost terminal. Empty disables the file and leaves logging as the only channel.
     STORM_EVENT_LOG = EnvStr("~/.freetoken/storm-events.jsonl")
+    # Exit the server once this many DISTINCT requests have tripped a breaker inside
+    # STORM_FATAL_WINDOW_S. One trip is a request the sampler could not serve; trips that keep
+    # arriving on new requests after the quarantine has run mean the poison sits in state the
+    # request does not own, and no later request can be trusted. 0 keeps serving and only logs.
+    STORM_FATAL_TRIPS = EnvInt(8)
+    STORM_FATAL_WINDOW_S = EnvFloat(300.0)
+    # Give the prefix cache a private clone of a donated GDN snapshot instead of the request's
+    # own slot. Transfer left one slot id owned by both the tree and a still-in-flight pipeline,
+    # so a late write through a retained alias poisoned every later hit of that branch.
+    LINEAR_STATE_COPY_ON_DONATE = EnvBool(True)
+    # Clear a freshly allocated live GDN slot before the first forward reads it as carry-in.
+    # A recycled slot holds whatever the previous owner left, including NaN.
+    LINEAR_STATE_CLEAR_ON_ADMIT = EnvBool(True)
     # Diagnostic: hook every layer module and name the first one whose output went
     # non-finite, reported with the abort above. One reduction per layer per step.
     NAN_TRACE = EnvBool(False)

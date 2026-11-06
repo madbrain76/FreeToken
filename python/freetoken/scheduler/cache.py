@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 from freetoken.core import Req
+from freetoken.env import ENV
 from freetoken.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
 from freetoken.utils import align_down, div_ceil, init_logger
 
@@ -33,7 +34,7 @@ _SWA_RETAIN_GAP = 16
 
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
-                 linear_state_pool=None, swa_pool=None, sliding_window_size=None):
+                 linear_state_pool=None, swa_pool=None, sliding_window_size=None, radix_lookahead: bool = False):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
@@ -63,6 +64,13 @@ class CacheManager:
         self.page_table = page_table
         self.page_size = page_size
         self.cache_type = type
+        # radix_lookahead keys position i by (t_i, t_{i+1}), so a hit also matches the token after it and a draft whose KV slot i depends on t_{i+1} (MTP) never reuses a slot written for a different next token
+        assert not (radix_lookahead and self.is_swa), "the SWA radix cache keeps token keys"
+        self.radix_lookahead = radix_lookahead
+        # The scheduler hands the engine's CUDA stream here so a donate's device copy lands in
+        # program order with the forwards, the way the COW restore already does. None (CPU tests,
+        # no engine) copies on the current stream.
+        self.donate_stream = None
 
     # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
     supports_runtime_rebuild = True
@@ -100,7 +108,8 @@ class CacheManager:
     def match_req(self, req: PendingReq, max_len: int | None = None) -> MatchResult:
         input_len = req.input_len
         assert input_len > 0, "Input length must be greater than 0."
-        ids = req.input_ids[: input_len - 1 if max_len is None else max(0, min(input_len - 1, max_len))]
+        limit = input_len - 1 if max_len is None else max(0, min(input_len - 1, max_len))
+        ids = self._keys(req.input_ids, limit)
         if self.is_swa:
             from freetoken.kvcache.swa_radix_cache import SWACacheHandle
             m = self.prefix_cache.match_prefix(ids)
@@ -357,6 +366,10 @@ class CacheManager:
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
     def cache_req(self, req: Req, *, finished: bool) -> None:
+        if getattr(req, "generation_poisoned", False):
+            # A breaker failed this request: its state and its KV carry the fault that produced
+            # them, so nothing it computed may become a prefix anyone else resumes from.
+            return self.discard_req(req)
         if self.is_swa:
             return self._cache_req_swa(req, finished=finished)
         if self.is_hybrid:
@@ -374,8 +387,8 @@ class CacheManager:
         #                                           We should free it if the request has finished.
         page_indices = self.page_table[req.table_idx, : req.cached_len]
         old_handle = req.cache_handle
-        insert_ids = req.input_ids[: req.cached_len]
-        cached_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, page_indices)
+        insert_ids = self._keys(req.input_ids, req.cached_len)
+        cached_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, page_indices[: len(insert_ids)])
         # unlock until all operations on handle is done
         self.unlock(old_handle)
         # this part is already in the prefix cache, free it. A naive-SWA request (swa_paged, no
@@ -430,12 +443,20 @@ class CacheManager:
                 and 0 < L <= req.cached_len
                 and align_down(L, self.page_size) == L
                 and req.mamba_ping_pong is not None
+                and len(keys := self._keys(req.input_ids, L)) == L
             ):
                 frozen_idx = 1 - req.mamba_next_track_idx
                 frozen = req.mamba_ping_pong[frozen_idx]
+                snapshot = self._donate_snapshot(pool, frozen)
                 prefix_len, mamba_exist = self.prefix_cache.insert(
-                    req.input_ids[:L], page_indices[:L], frozen, host_freed)
-                pool.free([s for s in req.mamba_ping_pong if mamba_exist or s != frozen])
+                    keys, page_indices[:L], snapshot, host_freed)
+                if snapshot != frozen:
+                    pool.free(list(req.mamba_ping_pong))
+                    if mamba_exist:
+                        pool.free([snapshot])      # the tree kept its own snapshot
+                else:
+                    pool.free([s for s in req.mamba_ping_pong
+                               if mamba_exist or s != frozen])
                 req.mamba_ping_pong = None
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
                 free_upto = max(free_upto, L)
@@ -446,13 +467,19 @@ class CacheManager:
             # remain as reuse points).
             insert_len = align_down(req.cached_len, self.page_size)
             keep_live = False
-            if insert_len == req.cached_len and insert_len > 0:
+            keys = self._keys(req.input_ids, insert_len)
+            if insert_len == req.cached_len and insert_len > 0 and len(keys) == insert_len:
+                snapshot = self._donate_snapshot(pool, req.linear_slot_idx)
                 prefix_len, mamba_exist = self.prefix_cache.insert(
-                    req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx,
+                    keys, page_indices[:insert_len], snapshot,
                     host_freed)
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
-                keep_live = not mamba_exist           # tree now owns linear_slot_idx
+                if snapshot != req.linear_slot_idx:
+                    if mamba_exist:
+                        pool.free([snapshot])        # the tree kept its own snapshot
+                else:
+                    keep_live = not mamba_exist      # transferred: tree owns the request's slot
             else:
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto :])
@@ -467,23 +494,25 @@ class CacheManager:
         L = req.mamba_last_track_seqlen
         if L is None:
             return  # no ×64 boundary crossed this chunk; req keeps its pages (committed later)
-        if align_down(L, self.page_size) != L:
-            # page_size>1 only: insert would align the key down, attaching a state that encodes
-            # L tokens to a SHORTER node -- a future hit would COW-restore an over-advanced
-            # state. Skip; the next aligned boundary (or the finish-donate) commits instead.
+        keys = self._keys(req.input_ids, L)
+        if align_down(L, self.page_size) != L or len(keys) != L:
+            # page_size>1, or a lookahead key short of the token after L: insert would attach a
+            # state that encodes L tokens to a SHORTER node -- a future hit would COW-restore an
+            # over-advanced state. Skip; the next boundary (or the finish-donate) commits instead.
             req.mamba_last_track_seqlen = None
             return
         frozen_idx = 1 - req.mamba_next_track_idx          # the slot the forward just wrote
         frozen = req.mamba_ping_pong[frozen_idx]
         host_freed: List[int] = []
+        snapshot = self._donate_snapshot(pool, frozen)
         prefix_len, mamba_exist = self.prefix_cache.insert(
-            req.input_ids[:L], page_indices[:L], frozen, host_freed)
+            keys, page_indices[:L], snapshot, host_freed)
         self.unlock(old_handle)
         self._free(page_indices[old_handle.cached_len : prefix_len])
         # Lock the committed snapshot node FIRST: the replacement-slot alloc below can trigger
         # evict_mamba (via ensure_mamba_slots), which would otherwise reclaim this still-unlocked
         # just-donated node -- freeing its KV pages under the still-decoding request.
-        m = self.prefix_cache.match_prefix(req.input_ids[:L])
+        m = self.prefix_cache.match_prefix(keys)
         # Same re-point as the generic path: the dedup free above returned this request's own
         # pages for [old_handle.cached_len, prefix_len) while its row still named them.
         if prefix_len > old_handle.cached_len:
@@ -491,7 +520,10 @@ class CacheManager:
                 m.kv_indices[old_handle.cached_len : prefix_len])
         req.cache_handle = HybridCacheHandle(m.cached_len, m.node, m.kv_indices)
         self.lock(req.cache_handle)
-        if not mamba_exist:                                # tree took `frozen`; replace it
+        if snapshot != frozen:
+            if mamba_exist:
+                pool.free([snapshot])                      # the tree kept its own snapshot
+        elif not mamba_exist:                              # tree took `frozen`; replace it
             self.ensure_mamba_slots(1)
             pp = list(req.mamba_ping_pong)
             pp[frozen_idx] = pool.alloc(1)[0]
@@ -513,6 +545,11 @@ class CacheManager:
         page_indices = self.page_table[req.table_idx, : req.cached_len]
 
         insert_len = align_down(req.cached_len, self.page_size)
+        if not finished and self.prefix_cache.has_locked_tombstone(
+                req.input_ids[:insert_len], old_handle.cached_len):
+            # insert would free our copy of a tombstone another request still locks, and the
+            # windowed re-match may stop before it (#204). Keep the pages; commit at finish.
+            return
         freed = page_indices[:0]
         if insert_len > 0:
             # insert reconciles tombstones (revives the in-window ones by ADOPTING the request's
@@ -585,14 +622,68 @@ class CacheManager:
         end = div_ceil(req.cached_len, self.page_size) * self.page_size
         return self.page_table[req.table_idx, start:end]
 
-    def _free_req_slots(self, req: Req, keep_live: bool = False) -> None:
+    def _donate_snapshot(self, pool, src: int | None) -> int | None:
+        """Return the slot id the tree should own for ``src``: a PRIVATE clone of it.
+
+        Donating the request's own slot left one slot id owned by both the tree and a pipeline
+        that was still in flight (overlap keeps a finishing request for one more step), so a late
+        write through any retained alias poisoned every subsequent hit of that branch -- the
+        sticky-window signature of a snapshot that never heals until the process restarts.
+        Falls back to the zero-copy transfer when the pool cannot spare a slot.
+        """
+        if src is None or not ENV.LINEAR_STATE_COPY_ON_DONATE.value:
+            return src
+        try:
+            self.ensure_mamba_slots(1)
+            clone = pool.alloc(1)[0]
+        except RuntimeError:
+            logger.warning_rank0(
+                f"GDN donate: no free slot to clone {src}, transferring it to the tree instead")
+            return src
+        if self.donate_stream is not None:
+            # Match the COW restore: on the engine stream, so the copy is program-ordered
+            # against the forwards instead of racing them from the scheduler stream.
+            with torch.cuda.stream(self.donate_stream):
+                pool.copy_from(src, clone)
+        else:
+            pool.copy_from(src, clone)
+        return clone
+
+    def discard_req(self, req: Req) -> None:
+        """Release a faulted request's pages and GDN state, publishing nothing to the tree.
+
+        A request a breaker failed has written NaN into its live slot, and the KV pages behind
+        it describe the step that produced it. Donating either would hand the poison to every
+        later request whose prefix hits it, which is how one bad step became a restart-only
+        outage. The request-owned span starts at the handle: [0, handle.cached_len) is the
+        prefix it matched, tree-owned and locked since admission.
+        """
+        handle = req.cache_handle
+        floor = handle.cached_len if handle is not None else 0
+        if handle is not None:
+            self.unlock(handle)
+        if req.table_idx != -1:
+            span = self.page_table[req.table_idx, floor : req.cached_len]
+            if self.swa_paged:
+                self._free_swa(span)
+            self._free(span)
+        if self.is_hybrid:
+            req.linear_state_fresh = False
+            self._free_req_slots(req, keep_live=False, clear=True)
+
+    def _free_req_slots(self, req: Req, keep_live: bool = False, clear: bool = False) -> None:
         """Return a finished request's GDN pool slots: both ping-pong slots, plus the live slot
         unless it was donated to the tree. Idempotent -- clears the refs so a re-entry frees
-        nothing (defense-in-depth against the abort/finish double-free, see _free_req_resources)."""
+        nothing (defense-in-depth against the abort/finish double-free, see _free_req_resources).
+        ``clear`` also wipes the contents, for a request released after a breaker trip."""
         slots = list(req.mamba_ping_pong) if req.mamba_ping_pong is not None else []
         if not keep_live and req.linear_slot_idx is not None:
             slots.append(req.linear_slot_idx)
         if slots:
+            if clear:
+                # Wipe before the free-list handover, not after: a later request must never be
+                # able to pick the slot up in the state this one left it in.
+                self.linear_state_pool.clear_slots(slots)
             self.linear_state_pool.free(slots)
         req.mamba_ping_pong = None
         req.linear_slot_idx = None
@@ -601,7 +692,10 @@ class CacheManager:
         if req.mamba_host_tracks:
             tracks = req.mamba_host_tracks
             req.mamba_host_tracks = None
-            self.linear_state_pool.free_host([h for _, h in tracks])
+            host_slots = [h for _, h in tracks]
+            if clear:
+                self.linear_state_pool.clear_host(host_slots)
+            self.linear_state_pool.free_host(host_slots)
             # Clear the shared list, not just this holder's attribute: overlap scheduling
             # builds the next chunk's Req from this one's list by identity (see
             # PrefillManager._add_one_req), so a sibling still points at the same object.
@@ -691,24 +785,32 @@ class CacheManager:
             del self._free
             self.free_slots = torch.cat([self.free_slots] + lazy_free_list)
 
+    def flush(self) -> int:
+        """Evict every unlocked prefix-cache entry and return the number of tokens freed."""
+        evictable = (self.prefix_cache.full_evictable_size if (self.is_hybrid or self.is_swa)
+                     else self.prefix_cache.size_info.evictable_size)
+        evicted = self._evict(evictable)
+        self._free(evicted)
+        return len(evicted)
+
+    def _evict(self, need: int) -> torch.Tensor:
+        if self.is_swa:
+            # Evicting KV leaf nodes drops their swa slots too -> return both pools.
+            ev = self.prefix_cache.evict_full(need)
+            self._free_swa(ev.swa_indices)
+            return ev.kv_indices
+        if self.is_hybrid:
+            # Evicting KV leaf nodes drops their GDN snapshots too -> return both pools.
+            er = self.prefix_cache.evict_full(need)
+            if er.mamba_slots:
+                self.linear_state_pool.free(er.mamba_slots)
+            self.linear_state_pool.free_host(er.host_slots)
+            return er.kv_indices
+        return self.prefix_cache.evict(need)
+
     def _allocate(self, needed_pages: int) -> torch.Tensor:
         if needed_pages > (free_pages := len(self.free_slots)):
-            need = (needed_pages - free_pages) * self.page_size
-            if self.is_swa:
-                # Evicting KV leaf nodes drops their swa slots too -> return both pools.
-                ev = self.prefix_cache.evict_full(need)
-                evicted = ev.kv_indices
-                self._free_swa(ev.swa_indices)
-            elif self.is_hybrid:
-                # Evicting KV leaf nodes drops their GDN snapshots too -> return both pools; a
-                # bank-resident copy of the same boundary dies with the KV it describes.
-                er = self.prefix_cache.evict_full(need)
-                evicted = er.kv_indices
-                if er.mamba_slots:
-                    self.linear_state_pool.free(er.mamba_slots)
-                self.linear_state_pool.free_host(er.host_slots)
-            else:
-                evicted = self.prefix_cache.evict(need)
+            evicted = self._evict((needed_pages - free_pages) * self.page_size)
             self.free_slots = torch.cat([self.free_slots, evicted[:: self.page_size]])
             assert len(self.free_slots) >= needed_pages, "Eviction did not free enough space."
         allocated = self.free_slots[:needed_pages]
@@ -718,6 +820,25 @@ class CacheManager:
     def _free(self, indices: torch.Tensor) -> None:
         if len(indices) > 0:
             self.free_slots = torch.cat([self.free_slots, indices[:: self.page_size]])
+
+    def _keys(self, ids: torch.Tensor, n: int) -> torch.Tensor:
+        """Radix keys of the first ``n`` positions of ``ids``; with radix_lookahead, fewer when the token after them is not known yet."""
+        if not self.radix_lookahead:
+            return ids[:n]
+        m = max(0, min(n, len(ids) - 1))
+        # ids stay below 2^31 (multimodal pseudo ids included), so a pair packs into one int64
+        return (ids[:m].to(torch.int64) << 31) | ids[1 : m + 1].to(torch.int64)
+
+    def rollback_tail(self, req: Req, keep_len: int, drop_len: int) -> None:
+        """Free the slots allocated for positions [keep_len, drop_len), rounded out to whole pages as allocate_paged allocates them.
+
+        Call inside lazy_free_region, after the forward that wrote them has drained.
+        """
+        start = div_ceil(keep_len, self.page_size) * self.page_size
+        end = div_ceil(drop_len, self.page_size) * self.page_size
+        assert not self.swa_paged, "rollback_tail frees no SWA slots; speculative decoding rejects SWA targets"
+        if end > start:
+            self._free(self.page_table[req.table_idx, start:end])
 
     def _page_to_token(self, pages: torch.Tensor) -> torch.Tensor:
         if self.page_size == 1:

@@ -6,11 +6,16 @@ import time
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
-from freetoken.attention.linear import build_fla_metadata
 from freetoken.core import Batch, Req
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
-from freetoken.storm import note_repeated_token, record_storm_event, row_fault
+from freetoken.storm import (
+    StormLedger,
+    StormUnrecoverable,
+    note_repeated_token,
+    record_storm_event,
+    row_fault,
+)
 from freetoken.message import (
     AbortBackendMsg,
     BaseBackendMsg,
@@ -20,6 +25,8 @@ from freetoken.message import (
     DetokenizeMsg,
     ErrorReplyMsg,
     ExitMsg,
+    FlushCacheBackendMsg,
+    FlushCacheResultMsg,
     PromptAdmittedMsg,
     UserMsg,
 )
@@ -43,6 +50,7 @@ from .table import TableManager
 
 if TYPE_CHECKING:
     from freetoken.engine import BatchSamplingArgs, ForwardOutput
+    from freetoken.engine.spec_protocol import SpecRuntime
 
 
 logger = init_logger(__name__)
@@ -71,7 +79,7 @@ class ForwardInput(NamedTuple):
     batch: Batch
     sample_args: BatchSamplingArgs
     input_tuple: Indice2D  # (token_mapping, positions)
-    write_tuple: Indice2D  # (req_mapping, seq_lens or -1)
+    write_tuple: Indice2D | None  # (req_mapping, seq_lens or -1); None on verify, whose drain writes the pending token
 
 
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
@@ -93,6 +101,7 @@ class Scheduler(SchedulerIOMixin):
 
         # initialize other managers
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
+        self.spec: SpecRuntime | None = self.engine.spec
         # ONE cache manager for every model (ShadowRadix layering): the shared page table is the
         # virtual full-token coordinate; model-specific tiers ride the plug-ins -- DSV4's
         # window/cmp/idx shadows via swa_pool, Gemma's swa via swa_pool, GDN state via
@@ -105,8 +114,15 @@ class Scheduler(SchedulerIOMixin):
                 (g.sliding_window for g in config.model_config.kv_cache_group_specs() if g.is_swa),
                 None,
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
+            radix_lookahead=self.spec is not None and self.spec.radix_lookahead,
         )
-        self.decode_manager = DecodeManager(config.page_size)
+        token_headroom = config.decode_rows_per_req - 1
+        # A donated snapshot is copied on the engine stream, where it is program-ordered against
+        # the forwards rather than racing them from the scheduler stream.
+        self.cache_manager.donate_stream = self.engine.stream
+        # Breaker trips, to tell one unlucky request from an engine that cannot recover.
+        self._storm = StormLedger()
+        self.decode_manager = DecodeManager(config.page_size, token_headroom=token_headroom)
         # Bound how long a run of prefill steps may starve in-flight decodes. A long
         # prompt chunked at the window budget is hundreds of consecutive prefill steps;
         # measured on an 8xRTX4090 DSV4 deployment, that left an already-decoding
@@ -122,6 +138,7 @@ class Scheduler(SchedulerIOMixin):
             self.decode_manager,
             encoder_cache=self.engine.encoder_cache,
             keep_images_whole=self._bidirectional_mm,
+            token_headroom=token_headroom,
         )
         self.layer_major = _supports_layer_major_prefill(config)
         if getattr(config, "prefill_layer_major", False) and not self.layer_major:
@@ -154,6 +171,8 @@ class Scheduler(SchedulerIOMixin):
         # prefill_manager, so a short request can still run; the pool grows once the scheduler
         # is idle. Every TP rank sees the same messages, so the list stays identical.
         self._kv_wait: list[UserMsg] = []
+        # A /v1/cache/flush waiting for the idle safe point, with its time.monotonic() deadline.
+        self._pending_flush: Tuple[FlushCacheBackendMsg, float] | None = None
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
         self.toolcall_anchor_id = None
@@ -262,6 +281,7 @@ class Scheduler(SchedulerIOMixin):
             or self.decode_manager.runnable
             or self._pending_rebuild is not None  # a queued rebuild to drain toward + execute
             or self._kv_wait  # an idle grow has to run; blocking here would wait for another request
+            or self._pending_flush is not None  # a deferred flush to run at idle or time out
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
@@ -277,6 +297,7 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable or self.decode_manager.runnable
         ):
             self._maybe_grow_kv()
+        self._check_pending_flush()
 
         # Order this iteration's host->device token_pool copies (issued on ``self.stream``
         # during scheduling) after the previous batch's sampled-token writes (issued on the
@@ -312,6 +333,7 @@ class Scheduler(SchedulerIOMixin):
             or self.decode_manager.runnable
             or self._pending_rebuild is not None  # a queued rebuild to execute at idle
             or self._kv_wait
+            or self._pending_flush is not None  # a deferred flush to run at idle or time out
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
@@ -325,6 +347,7 @@ class Scheduler(SchedulerIOMixin):
             self._execute_pending_rebuild()
         if not (self.prefill_manager.runnable or self.decode_manager.runnable):
             self._maybe_grow_kv()
+        self._check_pending_flush()
 
         forward_input = self._schedule_next_batch()
         ongoing_data = None
@@ -342,7 +365,7 @@ class Scheduler(SchedulerIOMixin):
         # backend's per-batch SNAPSHOT (staged in prepare_for_replay right before the replay, on
         # the same stream, like the generic out_loc copy_from), not the live slot maps -- so the
         # next batch's allocate_paged cannot corrupt the in-flight graph replay. DSV4 overlaps.
-        if ENV.DISABLE_OVERLAP_SCHEDULING:
+        if ENV.DISABLE_OVERLAP_SCHEDULING or self.spec is not None:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
@@ -414,140 +437,117 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
 
-        batch, (
-            _,
-            next_tokens_cpu,
-            copy_done,
-            fault_counts_cpu,
-            _,
-        ) = last_data[0].batch, last_data[1]
+        batch, output = last_data[0].batch, last_data[1]
+        _, next_tokens_cpu, copy_done = output[:3]
+        # SpecForwardOutput is a drain drop-in whose index 3 is emitted counts, so
+        # only the named field can tell the two apart.
+        fault_counts_cpu = getattr(output, "fault_counts_cpu", None)
         timeout = getattr(self.config, "step_timeout", None) or ENV.STEP_TIMEOUT.value
         self._wait_copy_done(copy_done, batch, timeout=timeout)
+        # tokens are on the host from here: the per-request timings' token stamps
+        now = time.perf_counter()
         reply: List[DetokenizeMsg] = []
         error_replies: List[ErrorReplyMsg] = []
         new_finished_reqs: Set[Req] = set()
+        generated = None
         with self.cache_manager.lazy_free_region():
-            for i, req in enumerate(batch.reqs):
-                if isinstance(req, ChunkedReq):
-                    # Don't cache intermediate chunks; the full prompt is cached once when the
-                    # final chunk is processed. Caching here snapshots a handle the next chunk
-                    # already copied (overlap), so cache_req double-frees the prior chunk.
+            if batch.phase == "verify":
+                generated = self._drain_verify(batch, output, reply, new_finished_reqs)
+            else:
+                for i, req in enumerate(batch.reqs):
+                    if isinstance(req, ChunkedReq):
+                        # Don't cache intermediate chunks; the full prompt is cached once when the
+                        # final chunk is processed. Caching here snapshots a handle the next chunk
+                        # already copied (overlap), so cache_req double-frees the prior chunk.
+                        if req.aborted:
+                            # Aborted mid-chunked-prefill while this chunk was in flight: the abort
+                            # popped the pending continuation (no next chunk launches), and this
+                            # drain point frees the chunk's pages/slots exactly once.
+                            self._free_req_resources(req)
+                        else:
+                            # The chunk's PAGES must stay out of the tree (double-free above), but its
+                            # x64 GDN checkpoint owns none: archive it here, stream-ordered after it.
+                            self.cache_manager.archive_chunk_track(req)
+                        continue
                     if req.aborted:
-                        # Aborted mid-chunked-prefill while this chunk was in flight: the abort
-                        # popped the pending continuation (no next chunk launches), and this
-                        # drain point frees the chunk's pages/slots exactly once.
-                        self._free_req_resources(req)
-                    else:
-                        # The chunk's PAGES must stay out of the tree (double-free above), but its
-                        # x64 GDN checkpoint owns none: archive it here, stream-ordered after it.
-                        self.cache_manager.archive_chunk_track(req)
-                    continue
-                if req.aborted:
-                    # Aborted while this final-chunk prefill / decode step was in flight: free
-                    # here (the forward is drained) and finish the request. No DetokenizeMsg --
-                    # the abort ack flushed after this method stays the uid's terminal reply.
-                    self.decode_manager.remove_req(req)
-                    self._free_req_resources(req)
-                    new_finished_reqs.add(req)
-                    continue
-                if req in self.finished_reqs:
-                    # Overlap scheduling launched one more decode step for a request that
-                    # already terminated (filter_reqs keeps it while output budget remains,
-                    # and the next batch is scheduled before this drain runs). Its resources
-                    # are freed below/already; shipping this token would append past the
-                    # client's terminal reply.
-                    continue
-                next_token = next_tokens_cpu[i]
-                fault = (
-                    row_fault(fault_counts_cpu[i]) if fault_counts_cpu is not None else None
-                )
-                if fault is not None and fault.is_fault:
-                    # The sampler cannot tell such a row from a healthy one: argmax answers
-                    # index 0 and the inverse-CDF draw leaves its zero-filled out untouched,
-                    # so this request would stream token 0 ("!") to its output budget.
-                    error_replies.append(
-                        self._degenerate_generation_reply(
-                            req,
-                            batch,
-                            code="nonfinite_logits",
-                            detail=f"non-finite logits ({fault.describe()}) at length "
-                            f"{req.input_ids.numel()}",
-                        )
-                    )
-                    if req not in self.finished_reqs:
+                        # Aborted while this final-chunk prefill / decode step was in flight: free
+                        # here (the forward is drained) and finish the request. No DetokenizeMsg --
+                        # the abort ack flushed after this method stays the uid's terminal reply.
                         self.decode_manager.remove_req(req)
                         self._free_req_resources(req)
                         new_finished_reqs.add(req)
-                    continue
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
-                # EOS / stop-string -> "stop", output budget exhausted -> "length";
-                # EOS and stop strings win over length.
-                # Overlap can advance device_len one token ahead of this host reply.
-                hit_length = req.input_ids.numel() >= req.max_device_len
-                hit_eos = (
-                    not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
-                )
-                matched_stop = (
-                    self._match_stop_str(req)
-                    if not hit_eos and req.sampling_params.stop_strs
-                    else None
-                )
-                finished = hit_length or hit_eos or matched_stop is not None
-                finish_reason = (
-                    ("stop" if (hit_eos or matched_stop is not None) else "length")
-                    if finished
-                    else None
-                )
-                if note_repeated_token(req, next_token, ENV.STORM_TOKEN_RUN.value):
-                    # The backstop for a collapse that stayed finite. No terminal token
-                    # reply: the client has already been streamed the run, so the request
-                    # ends as an error rather than as a completion of nonsense.
-                    error_replies.append(
-                        self._degenerate_generation_reply(
-                            req,
-                            batch,
-                            code="degenerate_repeat",
-                            detail=f"token {next_token} repeated {req.repeat_run}x in a row",
+                        continue
+                    if req in self.finished_reqs:
+                        # Overlap scheduling launched one more decode step for a request that
+                        # already terminated (filter_reqs keeps it while output budget remains,
+                        # and the next batch is scheduled before this drain runs). Its resources
+                        # are freed below/already; shipping this token would append past the
+                        # client's terminal reply.
+                        continue
+                    fault = (
+                        row_fault(fault_counts_cpu[i]) if fault_counts_cpu is not None else None
+                    )
+                    if fault is not None and fault.is_fault:
+                        # The sampler cannot tell such a row from a healthy one: argmax answers
+                        # index 0 and the inverse-CDF draw leaves its zero-filled out untouched,
+                        # so this request would stream token 0 ("!") to its output budget.
+                        # Quarantine it as well as failing it: its live slot holds the NaN and its
+                        # pages the step that produced it, and neither may become a reusable prefix.
+                        req.generation_poisoned = True
+                        error_replies.append(
+                            self._degenerate_generation_reply(
+                                req,
+                                batch,
+                                code="nonfinite_logits",
+                                detail=f"non-finite logits ({fault.describe()}) at length "
+                                f"{req.input_ids.numel()}",
+                            )
                         )
-                    )
-                    if req not in self.finished_reqs:
-                        self.decode_manager.remove_req(req)
-                        self._free_req_resources(req)
-                        new_finished_reqs.add(req)
-                    continue
-                if (
-                    next_token == self.toolcall_anchor_id
-                    and req.toolcall_anchor_len is None
-                    and not finished
-                ):
-                    req.toolcall_anchor_len = req.input_ids.numel()
-                reply.append(
-                    DetokenizeMsg(
-                        uid=req.uid,
-                        next_token=next_token,
-                        finished=finished,
-                        finish_reason=finish_reason,
-                        matched_stop=matched_stop,
-                        stop_strs=req.sampling_params.stop_strs or None,
-                    )
-                )
+                        if req not in self.finished_reqs:
+                            self.decode_manager.remove_req(req)
+                            self._free_req_resources(req)
+                            new_finished_reqs.add(req)
+                        continue
+                    msg, _ = self._commit_tokens(req, next_tokens_cpu[i : i + 1])
+                    token = int(next_tokens_cpu[i].item())
+                    if note_repeated_token(req, token, ENV.STORM_TOKEN_RUN.value):
+                        # The backstop for a collapse that stayed finite. No terminal token
+                        # reply: the client has already been streamed the run, so the request
+                        # ends as an error rather than as a completion of nonsense.
+                        error_replies.append(
+                            self._degenerate_generation_reply(
+                                req,
+                                batch,
+                                code="degenerate_repeat",
+                                detail=f"token {token} repeated {req.repeat_run}x in a row",
+                            )
+                        )
+                        if req not in self.finished_reqs:
+                            self.decode_manager.remove_req(req)
+                            self._free_req_resources(req)
+                            new_finished_reqs.add(req)
+                        continue
+                    req.stats.stamp_token(now)
+                    reply.append(msg)
+                    if msg.finished:
+                        msg.timings = req.stats.finish(req.input_ids.numel() - req.prompt_len)
+                    finished = msg.finished
 
-                # NOTE: overlap scheduling may make the request freed twice, skip second free
-                if finished and req not in self.finished_reqs:
-                    self.decode_manager.remove_req(req)
-                    self._free_req_resources(req)
-                    new_finished_reqs.add(req)
-                elif batch.is_prefill and req.table_idx != -1:
-                    # for prefill, non-chunk req, cache the prefix.
-                    # Polymorphic: the DSV4 naive manager keeps the request's slots (no-op);
-                    # the generic manager inserts the prefix into its radix/naive cache.
-                    # table_idx == -1 is defense-in-depth: aborts mark in-flight requests
-                    # instead of freeing them (handled above), so a freed request should
-                    # never reach this commit -- but if a future path frees one early, skip
-                    # rather than re-read the freed page-table row (and on hybrid, deref the
-                    # None'd GDN ping-pong slots).
-                    self.cache_manager.cache_req(req, finished=False)
+                    # NOTE: overlap scheduling may make the request freed twice, skip second free
+                    if finished and req not in self.finished_reqs:
+                        self.decode_manager.remove_req(req)
+                        self._free_req_resources(req)
+                        new_finished_reqs.add(req)
+                    elif batch.is_prefill and req.table_idx != -1:
+                        # for prefill, non-chunk req, cache the prefix.
+                        # Polymorphic: the DSV4 naive manager keeps the request's slots (no-op);
+                        # the generic manager inserts the prefix into its radix/naive cache.
+                        # table_idx == -1 is defense-in-depth: aborts mark in-flight requests
+                        # instead of freeing them (handled above), so a freed request should
+                        # never reach this commit -- but if a future path frees one early, skip
+                        # rather than re-read the freed page-table row (and on hybrid, deref the
+                        # None'd GDN ping-pong slots).
+                        self.cache_manager.cache_req(req, finished=False)
 
         self.finished_reqs = new_finished_reqs
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
@@ -576,10 +576,62 @@ class Scheduler(SchedulerIOMixin):
             page_size=self.config.page_size,
             mamba_slots=mamba_slots,
             swa_tokens=swa_tokens,
+            generated=generated,
         )
         self.send_result(reply)
         if error_replies:
             self.send_result(error_replies)
+        self._storm_check_fatal()
+
+    def _storm_check_fatal(self) -> None:
+        """Exit the server while a poisoned engine is still answering, rather than after it stops.
+
+        One trip is one request the sampler could not serve, and the quarantine has already
+        kept its state from spreading. Trips that keep arriving on new requests across a window
+        mean the poison is in state no request owns, so every later request is a coin flip and
+        the instance has to go down: it is the only thing that has ever cleared it, and a fast
+        visible exit beats a server that answers nothing.
+        """
+        limit = int(ENV.STORM_FATAL_TRIPS.value)
+        if limit <= 0:
+            return
+        ledger = getattr(self, "_storm", None)
+        if ledger is None:
+            return
+        window = float(ENV.STORM_FATAL_WINDOW_S.value)
+        bad = ledger.distinct_uids_within(window)
+        if bad < limit:
+            return
+        detail = (
+            f"{bad} distinct requests tripped a breaker in {window:.0f}s "
+            f"(limit {limit}); quarantine did not recover the engine"
+        )
+        # Evidence first: the ranks are about to die and a pane's scrollback is not evidence.
+        record_storm_event(
+            ENV.STORM_EVENT_LOG.value,
+            {
+                "event": "storm_fatal_exit",
+                "detail": detail,
+                "trips": [
+                    {"uid": uid, "code": code, "at": trip_at}
+                    for trip_at, uid, code in ledger.recent(window)
+                ],
+                "total_trips": ledger.total,
+            },
+        )
+        message = (
+            f"{detail}. Exiting so the scheduler state holding the poison is discarded; "
+            "set FREETOKEN_STORM_FATAL_TRIPS=0 to keep serving, FREETOKEN_NAN_TRACE=1 on the "
+            "next launch to name the module that produces the non-finite row."
+        )
+        try:
+            logger.error_rank0(f"STORM FATAL: {message}")
+        except Exception:
+            pass
+        # Let the reply sender drain: this rank exits the moment we raise, and a client that got
+        # no terminal reply would sit in wait_for_ack until ACK_IDLE_TIMEOUT instead of failing now.
+        time.sleep(0.5)
+        raise StormUnrecoverable(message)
 
     def _degenerate_generation_reply(
         self, req: Req, batch: Batch, *, code: str, detail: str
@@ -622,6 +674,13 @@ class Scheduler(SchedulerIOMixin):
             record_storm_event(ENV.STORM_EVENT_LOG.value, record)
         except Exception as e:
             logger.warning(f"Could not record the breaker trip for req {uid}: {e!r}")
+        try:
+            ledger = getattr(self, "_storm", None)
+            if ledger is None:
+                ledger = self._storm = StormLedger()
+            ledger.note(uid, code)
+        except Exception as e:  # noqa: BLE001 -- accounting never costs more than its fault
+            logger.warning(f"Could not ledger the breaker trip for req {uid}: {e!r}")
         message = (
             f"req {uid}: {detail}; first non-finite module: {where}; aborting the request "
             "instead of streaming a continuation that cannot become useful "
@@ -643,6 +702,78 @@ class Scheduler(SchedulerIOMixin):
             ),
             code=code,
         )
+
+    def _drain_verify(self, batch: Batch, output, reply: List[DetokenizeMsg], new_finished_reqs: Set[Req]) -> int:
+        """Commit each request's accepted tokens, return the slots its rejected rows took, then the target state; returns the tokens committed."""
+        k = self.config.decode_rows_per_req - 1
+        counts, finished = [], []
+        now = time.perf_counter()
+        for i, req in enumerate(batch.reqs):
+            # spec forces normal_loop, which frees an aborted request between steps; overlap would need rollback_tail here and must not donate the GDN slot the verify rolled
+            assert not req.aborted, "a verify batch drained an aborted request"
+            cached = req.cached_len
+            emitted = int(output.emitted_cpu[i])
+            msg, n = self._commit_tokens(req, output.next_tokens_cpu[i, : emitted + 1])
+            # k drafts were proposed; the step hands _commit_tokens the emitted accepted
+            # drafts plus the target's own token, so when a stop lands on a draft every
+            # committed token is an accepted draft: count min(n, emitted), with n already
+            # post stop-truncation. Never exceeds predicted_n - 1: the request's first
+            # committed token came from prefill, outside every verify step.
+            req.stats.stamp_token(now)
+            req.stats.draft_n += k
+            req.stats.draft_n_accepted += min(n, emitted)
+            reply.append(msg)
+            if msg.finished:
+                msg.timings = req.stats.finish(req.input_ids.numel() - req.prompt_len)
+            req.commit_pending(n)
+            self.cache_manager.rollback_tail(req, req.cached_len, cached + k + 1)
+            counts.append(n)
+            if msg.finished:
+                finished.append(req)
+        # before any finish free: the hybrid finish donates the live GDN slot the commit writes
+        self.engine.commit_verify(batch.reqs, counts, output.next_tokens_gpu)
+        # the last committed token is pending at cached_len, like a decode step's sampled token
+        table, pos, last = torch.tensor(
+            [(r.table_idx, r.cached_len, n - 1) for r, n in zip(batch.reqs, counts)],
+            dtype=torch.int64, pin_memory=self.device.type == "cuda",
+        ).to(self.device, non_blocking=True).unbind(1)
+        self.token_pool[table, pos] = output.next_tokens_gpu.gather(1, last.unsqueeze(1)).squeeze(1).to(self.token_pool.dtype)
+        for req in finished:
+            self.decode_manager.remove_req(req)
+            self._free_req_resources(req)
+            new_finished_reqs.add(req)
+        return sum(counts)
+
+    def _commit_tokens(self, req: Req, tokens: torch.Tensor) -> Tuple[DetokenizeMsg, int]:
+        """Append sampled tokens in order until one finishes the request; returns the reply and how many tokens were committed."""
+        params = req.sampling_params
+        committed: List[int] = []
+        finished, finish_reason, matched_stop = False, None, None
+        for j in range(tokens.numel()):
+            req.append_host(tokens[j : j + 1])
+            token = int(tokens[j].item())
+            committed.append(token)
+            # EOS / stop-string -> "stop", output budget exhausted -> "length";
+            # EOS and stop strings win over length.
+            # Overlap can advance device_len one token ahead of this host reply.
+            hit_length = req.input_ids.numel() >= req.max_device_len
+            hit_eos = not params.ignore_eos and token in self.eos_token_ids
+            matched_stop = self._match_stop_str(req) if not hit_eos and params.stop_strs else None
+            if hit_length or hit_eos or matched_stop is not None:
+                finished = True
+                finish_reason = "stop" if (hit_eos or matched_stop is not None) else "length"
+                break
+            if token == self.toolcall_anchor_id and req.toolcall_anchor_len is None:
+                req.toolcall_anchor_len = req.input_ids.numel()
+        msg = DetokenizeMsg(
+            uid=req.uid,
+            next_tokens=committed,
+            finished=finished,
+            finish_reason=finish_reason,
+            matched_stop=matched_stop,
+            stop_strs=params.stop_strs or None,
+        )
+        return msg, len(committed)
 
     def _match_stop_str(self, req: Req) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes
@@ -853,6 +984,8 @@ class Scheduler(SchedulerIOMixin):
                 self._reply_rebuild(msg.request_id, "busy")
             else:
                 self._pending_rebuild = msg
+        elif isinstance(msg, FlushCacheBackendMsg):
+            self._handle_flush(msg)
         else:
             logger.error(f"Unknown message type: {type(msg)}")
             raise NotImplementedError
@@ -868,6 +1001,8 @@ class Scheduler(SchedulerIOMixin):
             src, host = req.mamba_restore_src, req.mamba_restore_host
             # Consumed exactly once: a stale ref would re-copy over a live slot mid-decode.
             req.mamba_restore_src = req.mamba_restore_host = None
+            fresh = req.linear_state_fresh
+            req.linear_state_fresh = False
             if src is not None:
                 pool.copy_from(src, req.linear_slot_idx)
             elif host is not None:
@@ -876,6 +1011,12 @@ class Scheduler(SchedulerIOMixin):
                 pool.from_host(host, req.linear_slot_idx)
                 logger.info_rank0(
                     f"GDN bank: resuming req {req.uid} from host slot {host}")
+            elif fresh and req.linear_slot_idx is not None and ENV.LINEAR_STATE_CLEAR_ON_ADMIT.value:
+                # Nothing is being restored into this slot and the GDN kernels read it as
+                # carry-in, so it still holds whoever had it before -- possibly their NaN. Only a
+                # freshly admitted request gets here: a chunked continuation inherits live state
+                # and is never marked fresh.
+                pool.clear_slots([req.linear_slot_idx])
 
     def _free_req_resources(self, req: Req) -> None:
         # Idempotent: an EOS-finished request can stay in running_reqs (output budget left), so an
@@ -884,6 +1025,8 @@ class Scheduler(SchedulerIOMixin):
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
             return
+        if self.spec is not None:
+            self.spec.release(req)
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).
@@ -1067,6 +1210,43 @@ class Scheduler(SchedulerIOMixin):
         self._log_cache_geometry("Cache rebuilt")
         self._reply_rebuild(msg.request_id, "ok")
 
+    def _handle_flush(self, msg: FlushCacheBackendMsg) -> None:
+        # Same idle/timeout contract as sglang's /flush_cache. Even timeout=0 waits for this iteration's safe point.
+        if self.config.tp_info.size > 1:
+            # each rank checks the deadline on its own clock, so a deferred flush could run on only some ranks
+            self._reply_flush(msg.request_id, "unsupported", "cache flush unsupported under TP > 1")
+        elif self._pending_flush is not None:
+            self._reply_flush(msg.request_id, "busy", "another cache flush is already waiting")
+        else:
+            self._pending_flush = (msg, time.monotonic() + msg.timeout)
+
+    def _check_pending_flush(self) -> None:
+        """Run the pending flush once the scheduler is fully idle, or fail it at its deadline."""
+        if self._pending_flush is None:
+            return
+        msg, deadline = self._pending_flush
+        if self._last_data is None and not (
+            self.prefill_manager.runnable or self.decode_manager.runnable
+        ):
+            self._pending_flush = None
+            freed = self.cache_manager.flush()
+            self.cache_manager.check_integrity()
+            logger.info_rank0(f"Cache flushed: {freed} prefix-cache tokens freed")
+            self._reply_flush(msg.request_id, "ok")
+        elif time.monotonic() >= deadline:
+            self._pending_flush = None
+            error = (
+                "scheduler is not idle: "
+                f"{len(self.prefill_manager.pending_list)} queued, "
+                f"{len(self.decode_manager.running_reqs)} running"
+                + (", last batch still in flight" if self._last_data is not None else "")
+            )
+            logger.warning_rank0(f"Cache not flushed, {error}")
+            self._reply_flush(msg.request_id, "timeout" if msg.timeout > 0 else "busy", error)
+
+    def _reply_flush(self, request_id: str, status: str, error: str | None = None) -> None:
+        self.send_result([FlushCacheResultMsg(request_id=request_id, status=status, error=error)])
+
     def _current_cache_geometry(self) -> dict:
         """The pools' current (serving) sizes as rebuild_cache kwargs — the rollback snapshot and
         the single source for _reply_rebuild's readout. None for a pool this model lacks
@@ -1121,9 +1301,11 @@ class Scheduler(SchedulerIOMixin):
             logger.warning(f"could not log cache geometry: {e!r}")
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
+        if self.spec is not None and batch.is_decode:
+            batch.phase, batch.rows_per_req = "verify", self.config.decode_rows_per_req
         self.engine.graph_runner.pad_batch(batch)
         self._forward_iter += 1
-        if batch.is_decode:
+        if not batch.is_prefill:
             # Free each decoding request's now-out-of-window SWA slots BEFORE the alloc below,
             # so they can back the new token -- this is what bounds the per-request swa
             # footprint during decode. (no-op unless the model is SWA / paged swa pool.)
@@ -1136,43 +1318,32 @@ class Scheduler(SchedulerIOMixin):
             # this chunk, so a chunked prompt longer than the swa pool never accumulates its
             # whole swa footprint (which would exhaust alloc_swa). No-op unless SWA/paged.
             self.cache_manager.free_swa_out_of_window_extend(batch.reqs)
+        # before the widening below, so the penalty check reads each request's real remain_len
+        sample_args = self.engine.sampler.prepare(batch)
+        # widened after the window free above, whose threshold reads device_len
+        if batch.phase == "verify":
+            for req in batch.reqs:
+                req.widen_pending(batch.rows_per_req - 1)
         # Polymorphic page allocation: DSV4 allocates window pages + cmp/idx blocks into its
         # slot maps; the generic manager allocates KV pages into the page table.
         self.cache_manager.allocate_paged(batch.reqs)
+        if batch.phase == "verify":
+            # the drafts run on the GPU while the host builds this batch's metadata below
+            self.spec.propose_into(batch.reqs, self.token_pool)
         if batch.is_prefill:
             self._gather_multimodal(batch)
         batch.positions = _make_positions(batch, self.device)
         if self._model_is_mrope:
             batch.mrope_positions = _make_mrope_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
-        write_mapping = _make_write_tuple(batch, self.device)
+        write_mapping = None if batch.phase == "verify" else _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
-        if self.engine.linear_state_pool is not None:
-            if batch.is_decode:
-                # GPU GDN-state slot (one per padded request) for the decode gather/scatter;
-                # lands in the CUDA-graph input buffer via copy_from. Gate on the cache mode,
-                # NOT on whether any padded req has a linear_slot_idx -- the persistent dummy
-                # req always carries one (= padding_slot), so that test is True even for naive
-                # and would collapse all real naive reqs onto the padding slot. Hybrid: build
-                # per padded req from Req.linear_slot_idx (dummy -> padding_slot). Naive: keep
-                # the old keying = input_mapping's table_idx column (already staged, no H2D).
-                if self.cache_manager.is_hybrid:
-                    pool = self.engine.linear_state_pool
-                    slots = [r.linear_slot_idx if r.linear_slot_idx is not None
-                             else pool.padding_slot for r in batch.padded_reqs]
-                    batch.linear_table_idx = torch.tensor(
-                        slots, dtype=torch.int32, device="cpu", pin_memory=True
-                    ).to(self.device, non_blocking=True)
-                else:
-                    batch.linear_table_idx = input_mapping[0].to(torch.int32)
-            # Per-forward GDN metadata (cu_seqlens / cache_indices / continuation flags),
-            # built once here instead of rebuilt in each of the 30 GDN layers. For decode
-            # under CUDA graph the persistent cu_seqlens buffer is supplied by set_batch.
-            batch.fla_metadata = build_fla_metadata(batch, self.device)
-        if batch.is_decode:
+        if self.engine.linear_backend is not None:
+            self.engine.linear_backend.prepare_metadata(batch)
+        if not batch.is_prefill:
             # This batch's padded per-row page-table rows. Backends that snapshot the table for
             # a captured replay (DSV4) read them in prepare_metadata / prepare_for_replay.
-            batch.active_table_idx = input_mapping[0].view(-1)
+            batch.active_table_idx = input_mapping[0][:: batch.rows_per_req].view(-1)
         self.engine.attn_backend.prepare_metadata(batch)
         if (
             self.layer_major
@@ -1185,7 +1356,7 @@ class Scheduler(SchedulerIOMixin):
             batch.layer_major = True
         return ForwardInput(
             batch=batch,
-            sample_args=self.engine.sampler.prepare(batch),
+            sample_args=sample_args,
             input_tuple=input_mapping,
             write_tuple=write_mapping,
         )
@@ -1263,6 +1434,8 @@ class Scheduler(SchedulerIOMixin):
         batch.input_ids = self.token_pool[input_mapping]
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
+        if batch.phase == "verify":
+            return self.spec.verify_step(batch, sample_args)
         forward_output = self.engine.forward_batch(batch, sample_args)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)

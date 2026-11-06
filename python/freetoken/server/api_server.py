@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Literal
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from freetoken import __version__
 from freetoken.core import SamplingParams
@@ -27,9 +27,12 @@ from freetoken.message import (
     BatchFrontendMsg,
     CacheRebuildMsg,
     CacheRebuildReply,
+    FlushCacheMsg,
+    FlushCacheReply,
     TokenizeMsg,
     UserReply,
 )
+from freetoken.storm import STORM_EXIT_CODE
 from freetoken.utils import (
     ZmqAsyncPullQueue,
     ZmqAsyncPushQueue,
@@ -67,6 +70,13 @@ BACKEND_DEATH_EXIT_GRACE_S = 10.0
 # indefinitely -- which is what "the server stopped answering and only a restart fixed it"
 # looks like from the client side.
 BACKEND_DEATH_FORCE_GRACE_S = 30.0
+# How long the give-up path lets the event loop push terminal replies before it goes. Bounded
+# and independent of the clients: it is a flush window, not a drain we wait on.
+STORM_EXIT_FLUSH_S = 0.5
+# How much longer the give-up may take before the process is killed by its own backstop. The
+# ranks it abandons can wedge in driver teardown, and a give-up that stalls there is a serve
+# that keeps a port open while answering nothing.
+STORM_EXIT_SELF_KILL_S = 2.0
 
 
 def get_global_state() -> FrontendManager:
@@ -94,8 +104,89 @@ def _terminate_backend_workers(processes: List[Any]) -> None:
             continue
 
 
+class _ExitTimers:
+    """Every timer behind one exit path, so a caller cancels all of them or none."""
+
+    def __init__(self, *timers: threading.Timer) -> None:
+        self._timers = timers
+
+    def cancel(self) -> None:
+        for timer in self._timers:
+            try:
+                timer.cancel()
+            except Exception:  # noqa: BLE001 -- cancelling is best-effort by definition
+                continue
+
+
+def _backend_worker_pids(processes: List[Any]) -> List[int]:
+    """The ranks' pids, read without touching anything that can block.
+
+    Deliberately pids and not the process handles: asking a handle whether its process lives can
+    reap it, and on the give-up path even that has to be off the critical path.
+    """
+    pids: List[int] = []
+    for p in processes or []:
+        try:
+            pid = getattr(p, "pid", None)
+            if pid:
+                pids.append(int(pid))
+        except Exception:  # noqa: BLE001 -- unqueryable handle: nothing to signal
+            continue
+    return pids
+
+
+def _kill_backend_workers_detached(pids: List[int]) -> None:
+    """SIGKILL the ranks from a child this process never waits on.
+
+    The engine that gave up can leave ranks parked in a collective allowed to run for
+    ``--distributed-timeout`` (30 days as launched), and putting them down from here risked the
+    same thing that hung the serve: waiting on a wedged rank. The child does nothing but raw
+    kills and ``_exit``, so forking it from a multithreaded parent stays safe.
+    """
+    if not pids:
+        return
+    try:
+        pid = os.fork()
+    except OSError:
+        pid = -1
+    if pid == 0:
+        try:
+            os.setsid()  # outlive us, and a ^C meant for the serve
+        except OSError:
+            pass
+        for target in pids:
+            try:
+                os.kill(target, signal.SIGKILL)
+            except OSError:
+                pass  # already gone
+        os._exit(0)
+    if pid < 0:  # no child available: signal in place, still without joining anything
+        for target in pids:
+            try:
+                os.kill(target, signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def _self_kill_after_give_up() -> None:
+    """Last resort: the kernel takes this process down because Python could not.
+
+    On its own timer thread, so nothing the give-up path does afterwards -- a rank wedged in an
+    uninterruptible driver wait, a log record into a pipe nobody drains -- can keep a serve that
+    has already declared itself broken alive. It writes no log line: the record would have to
+    succeed before the thing that cannot block, and flash_guards reports the kill instead.
+    """
+    try:
+        os.kill(os.getpid(), signal.SIGKILL)
+    except OSError:  # noqa: BLE001 -- nothing left to try, and nothing to wait for either
+        pass
+
+
 def _exit_after_backend_death(
-    grace_s: float, force_grace_s: float = BACKEND_DEATH_FORCE_GRACE_S
+    grace_s: float,
+    force_grace_s: float = BACKEND_DEATH_FORCE_GRACE_S,
+    *,
+    immediate: bool = False,
 ) -> threading.Timer:
     # Whether THIS path sent the SIGTERM. Deliberately not _SHUTTING_DOWN: that flag is set
     # by the signal handler the SIGTERM triggers, so gating the escalation on it would skip
@@ -122,6 +213,37 @@ def _exit_after_backend_death(
         _terminate_backend_workers(processes)
         _reap_backend_workers(processes)
         os.kill(os.getpid(), signal.SIGKILL)
+
+    def _hard_exit(backstop: threading.Timer) -> None:
+        if _SHUTTING_DOWN.is_set():
+            # An external stop got here first and its drain may be legitimate; it owns the exit.
+            backstop.cancel()
+            return
+        logger.error(
+            "Backend gave up on a broken engine; exiting now without waiting for connected "
+            "clients (their requests were failed before the shutdown was requested)"
+        )
+        # Nothing between the log line and os._exit may be able to block, because a block here
+        # is a serve that stays up: pids are read attribute-only and the ranks are killed by a
+        # child we never join. The backstop covers whatever this still cannot predict.
+        processes = list(getattr(_GLOBAL_STATE, "backend_processes", None) or [])
+        _kill_backend_workers_detached(_backend_worker_pids(processes))
+        backstop.cancel()
+        os._exit(STORM_EXIT_CODE)
+
+    if immediate:
+        # No SIGTERM, so no uvicorn lifespan shutdown and no connection drain: the backend this
+        # serve answers with is gone, and every connection we would wait on is one that can never
+        # be answered. The window only lets already-marshalled terminal replies reach the socket.
+        backstop = threading.Timer(
+            STORM_EXIT_FLUSH_S + STORM_EXIT_SELF_KILL_S, _self_kill_after_give_up
+        )
+        backstop.daemon = True
+        backstop.start()
+        timer = threading.Timer(STORM_EXIT_FLUSH_S, lambda: _hard_exit(backstop))
+        timer.daemon = True
+        timer.start()
+        return _ExitTimers(timer, backstop)
 
     timer = threading.Timer(grace_s, _stop)
     timer.daemon = True
@@ -192,6 +314,8 @@ class FrontendManager:
     # Runtime cache-rebuild control plane (correlated by uuid request_id, separate from
     # the int-uid generation ack machinery).
     rebuild_futures: Dict[str, asyncio.Future] = field(default_factory=dict)
+    # /v1/cache/flush waiters by request_id; the scheduler owns the deadline, so there is no HTTP timeout.
+    flush_futures: Dict[str, asyncio.Future] = field(default_factory=dict)
     # Lifecycle gate. Starts "loading" (uvicorn binds before weights finish; the three
     # API adapters 503 until this flips) -> "serving" once all workers ack ready ->
     # "rebuilding"/"failed" for runtime cache rebuilds.
@@ -298,6 +422,11 @@ class FrontendManager:
             if isinstance(msg, CacheRebuildReply):
                 self._resolve_rebuild(msg)
                 continue
+            if isinstance(msg, FlushCacheReply):
+                fut = self.flush_futures.pop(msg.request_id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result(msg)
+                continue
             for msg in _unwrap_msg(msg):
                 # Global accounting follows actual admitted/sampled work even after the HTTP
                 # client disconnects and abort_user removes its ack queue. Delivery to a live
@@ -346,7 +475,8 @@ class FrontendManager:
         caller blocked in dispatch_rebuild's ``await`` would otherwise hang until its full
         timeout (up to 300s). Runs the resolution ON the event loop via call_soon_threadsafe —
         asyncio Futures are not thread-safe, and _resolve_rebuild only ever calls set_result
-        from the loop thread (the listen() task), so we mirror that here from off-thread."""
+        from the loop thread (the listen() task), so we mirror that here from off-thread.
+        Pending /v1/cache/flush waiters fail the same way."""
         loop = self._loop
         if loop is None:
             return  # listener never started -> no futures could be pending
@@ -357,6 +487,10 @@ class FrontendManager:
                 fut = self.rebuild_futures.pop(request_id, None)
                 if fut is not None and not fut.done():
                     fut.set_result(dict(result))
+            for request_id in list(self.flush_futures):
+                fut = self.flush_futures.pop(request_id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result(FlushCacheReply(request_id=request_id, status="failed", error=message))
 
         try:
             loop.call_soon_threadsafe(_resolve_all)
@@ -706,14 +840,11 @@ def _resolve_num_swa_pages(state: FrontendManager, req: CacheRebuildRequest) -> 
     return max(1, -(-window_tokens // swa_page_size))  # ceil-div to the pool's page unit
 
 
-@app.post("/v1/cache/rebuild")
-async def cache_rebuild(req: CacheRebuildRequest):
-    """Trigger a runtime KV/MoE cache resize. Blocks until the scheduler reports a result
-    (or timeout). New generation is gated (503) while a rebuild is in flight."""
-    state = get_global_state()
+def _maintenance_rejection(state: FrontendManager, action: str) -> JSONResponse | None:
+    """The /v1/cache/* refusal while the engine is not serving, or None to proceed."""
     if state.maintenance_state == "loading":
         return JSONResponse(
-            {"status": "loading", "error": "model is still loading; cannot rebuild cache yet"},
+            {"status": "loading", "error": f"model is still loading; cannot {action} yet"},
             status_code=503,
         )
     if state.maintenance_state == "failed":
@@ -731,6 +862,16 @@ async def cache_rebuild(req: CacheRebuildRequest):
             {"status": "busy", "error": "engine stop is in progress"},
             status_code=409,
         )
+    return None
+
+
+@app.post("/v1/cache/rebuild")
+async def cache_rebuild(req: CacheRebuildRequest):
+    """Trigger a runtime KV/MoE cache resize. Blocks until the scheduler reports a result
+    (or timeout). New generation is gated (503) while a rebuild is in flight."""
+    state = get_global_state()
+    if (rejection := _maintenance_rejection(state, "rebuild cache")) is not None:
+        return rejection
     if req.num_swa_pages is not None and req.swa_full_tokens_ratio is not None:
         return JSONResponse(
             {"status": "failed", "error": "pass num_swa_pages OR swa_full_tokens_ratio, not both"},
@@ -757,6 +898,33 @@ async def cache_rebuild(req: CacheRebuildRequest):
     if result["status"] == "timeout":
         return JSONResponse(result, status_code=504)
     return JSONResponse(result, status_code=200 if result["status"] == "ok" else 503)
+
+
+@app.api_route("/v1/cache/flush", methods=["GET", "POST"])
+async def cache_flush(timeout: float = Query(0.0, ge=0.0)):
+    """Drop every prefix-cache entry once the scheduler is idle, waiting up to ``timeout`` seconds."""
+    state = get_global_state()
+    if (rejection := _maintenance_rejection(state, "flush cache")) is not None:
+        return rejection
+    request_id = str(uuid.uuid4())
+    fut = asyncio.get_running_loop().create_future()
+    state.flush_futures[request_id] = fut
+    try:
+        await state.send_one(FlushCacheMsg(request_id=request_id, timeout=timeout))
+    except Exception as e:  # noqa: BLE001
+        state.flush_futures.pop(request_id, None)
+        return JSONResponse(
+            {"status": "failed", "error": f"failed to dispatch flush: {e!r}"}, status_code=503
+        )
+    try:
+        reply = await fut
+    finally:
+        state.flush_futures.pop(request_id, None)
+    body = {"status": reply.status}
+    if reply.error is not None:
+        body["error"] = reply.error
+    status_code = {"ok": 200, "timeout": 504}.get(reply.status, 503)
+    return JSONResponse(body, status_code=status_code)
 
 
 def _cache_limits(geo: dict, unit_bytes: dict, pool_budget: int, floors: dict) -> dict:
@@ -1141,7 +1309,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
             _GLOBAL_STATE.ready_at = time.monotonic()
             logger.info(f"API server is ready to serve on {host}:{port}")
 
-    def _on_failure(message: str) -> None:
+    def _on_failure(message: str, exitcode: int | None = None) -> None:
         _GLOBAL_STATE.fatal_error = message
         _GLOBAL_STATE.maintenance_state = "failed"
         logger.error("Backend supervisor: %s", message)
@@ -1153,10 +1321,17 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         _GLOBAL_STATE.fail_admitted_requests(
             f"FreeToken backend died: {message}. The request was never answered."
         )
+        # A rank that raised the storm breaker exits with a code of its own. That death is a
+        # deliberate give-up, not a crash: the engine is known broken, so waiting the exit grace
+        # and then letting uvicorn drain connections that can never be answered only delays the
+        # restart that has to happen anyway.
+        immediate_exit = exitcode == STORM_EXIT_CODE
         # Then take the whole serve down (see _exit_after_backend_death). Shell mode is excluded:
         # a person is sitting at that TUI, the API is theirs alone, and its stop path is ^C.
         if not run_shell:
-            _exit_after_backend_death(BACKEND_DEATH_EXIT_GRACE_S)
+            _exit_after_backend_death(
+                BACKEND_DEATH_EXIT_GRACE_S, immediate=immediate_exit
+            )
 
     def _on_meta(meta: dict) -> None:
         # Per-unit cache VRAM costs + the free-VRAM seed + per-pool floors + the actual pool

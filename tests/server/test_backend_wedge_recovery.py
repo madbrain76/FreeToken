@@ -9,6 +9,10 @@ only a restart helps. These drive the real frontend machinery.
 """
 
 import asyncio
+import signal
+import os
+import time
+from types import SimpleNamespace
 
 from freetoken.server import api_server as AS
 
@@ -129,3 +133,131 @@ def test_the_shutdown_still_escalates_when_the_drain_never_finishes(monkeypatch)
             break
     timer.cancel()
     assert killed == ["TERM", "KILL"], f"expected SIGTERM then SIGKILL, got {killed}"
+
+
+def _wait_for(predicate, timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def test_a_storm_give_up_exits_without_waiting_for_connected_clients(monkeypatch):
+    """The engine said it is broken; every live connection is one it can never answer.
+
+    The ordinary post-death path SIGTERMs and lets uvicorn drain, bounded only by
+    ``BACKEND_DEATH_EXIT_GRACE_S`` plus ``BACKEND_DEATH_FORCE_GRACE_S``. For a deliberate
+    give-up that wait is pure latency before the restart the operator has to do anyway, so the
+    exit must be bounded by a constant and must not depend on the clients at all.
+    """
+    signals, exits, killed_pids = [], [], []
+
+    monkeypatch.setattr(
+        AS,
+        "_GLOBAL_STATE",
+        SimpleNamespace(backend_processes=[SimpleNamespace(pid=4242), SimpleNamespace(pid=None), object()]),
+    )
+    monkeypatch.setattr(AS, "STORM_EXIT_FLUSH_S", 0.01)
+    monkeypatch.setattr(AS.os, "kill", lambda pid, sig: signals.append(sig))
+    monkeypatch.setattr(AS.os, "_exit", lambda code: exits.append(code))
+    monkeypatch.setattr(AS, "_kill_backend_workers_detached", lambda pids: killed_pids.append(pids))
+    monkeypatch.setattr(AS.signal, "SIGTERM", "TERM", raising=False)
+    monkeypatch.setattr(AS.signal, "SIGKILL", "KILL", raising=False)
+    AS._SHUTTING_DOWN.clear()
+
+    started = time.monotonic()
+    try:
+        timers = AS._exit_after_backend_death(
+            AS.BACKEND_DEATH_EXIT_GRACE_S, force_grace_s=AS.BACKEND_DEATH_FORCE_GRACE_S,
+            immediate=True,
+        )
+        reached = _wait_for(lambda: bool(exits))
+    finally:
+        timers.cancel()
+    elapsed = time.monotonic() - started
+
+    assert reached, f"the give-up never exited: signals={signals}"
+    assert exits == [AS.STORM_EXIT_CODE], "the launcher relies on the storm exit code"
+    assert signals == [], f"must not SIGTERM, that is what parks us in the drain: {signals}"
+    # The ranks must be put down (they would otherwise hold the GPUs for a whole month of
+    # distributed timeout) and only the live pids are worth signalling.
+    assert killed_pids == [[4242]], f"the ranks it leaves behind must not keep the GPUs: {killed_pids}"
+    assert elapsed < AS.BACKEND_DEATH_EXIT_GRACE_S, (
+        f"waited {elapsed:.2f}s, as long as the drain path it replaces"
+    )
+
+
+def test_a_give_up_that_never_finishes_still_takes_the_process_down(monkeypatch):
+    """The 2026-11-06 failure mode: it logged the exit, hung, and the serve lived on.
+
+    All four ranks announced the give-up; one died after 13s and the rest never did, so the
+    frontend printed "exiting now without waiting for connected clients" and then sat holding the
+    port -- and the launcher's restart loop, waiting on a child that never exits, never restarted
+    anything. Whatever is left between the announcement and the exit must therefore be unable to
+    hold the process: the path arms a kernel-level backstop of its own before it touches them.
+    """
+    signals, exits = [], []
+
+    def hang_forever(pids):
+        time.sleep(30)  # what a rank wedged in driver teardown does to a caller that waits
+
+    monkeypatch.setattr(
+        AS, "_GLOBAL_STATE", SimpleNamespace(backend_processes=[SimpleNamespace(pid=4242)])
+    )
+    monkeypatch.setattr(AS, "STORM_EXIT_FLUSH_S", 0.01)
+    monkeypatch.setattr(AS, "STORM_EXIT_SELF_KILL_S", 0.2)
+    monkeypatch.setattr(AS, "_kill_backend_workers_detached", hang_forever)
+    monkeypatch.setattr(AS.os, "_exit", lambda code: exits.append(code))
+    monkeypatch.setattr(AS.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+    AS._SHUTTING_DOWN.clear()
+
+    self_kill = (os.getpid(), signal.SIGKILL)
+    started = time.monotonic()
+    try:
+        timers = AS._exit_after_backend_death(AS.BACKEND_DEATH_EXIT_GRACE_S, immediate=True)
+        backstopped = _wait_for(lambda: self_kill in signals and not exits, timeout=3.0)
+    finally:
+        timers.cancel()
+    elapsed = time.monotonic() - started
+
+    assert not exits, "the simulated wedge should have prevented the orderly exit"
+    assert backstopped, f"nothing killed the wedged give-up: {signals}"
+    assert all(sig != signal.SIGTERM for _, sig in signals), (
+        "a SIGTERM is the drain this path exists to avoid"
+    )
+    assert elapsed < AS.BACKEND_DEATH_EXIT_GRACE_S, (
+        f"the backstop took {elapsed:.2f}s, no better than the drain it replaces"
+    )
+
+
+def test_a_storm_give_up_stays_quiet_when_an_external_stop_got_there_first(monkeypatch):
+    """An operator ^C owns the shutdown; the give-up must not hijack its drain."""
+    exits = []
+    monkeypatch.setattr(AS, "_GLOBAL_STATE", SimpleNamespace(backend_processes=[]))
+    monkeypatch.setattr(AS, "STORM_EXIT_FLUSH_S", 0.0)
+    monkeypatch.setattr(AS.os, "_exit", lambda code: exits.append(code))
+    AS._SHUTTING_DOWN.set()
+    try:
+        timer = AS._exit_after_backend_death(10.0, immediate=True)
+        assert not _wait_for(lambda: bool(exits), timeout=0.3)
+        timer.cancel()
+    finally:
+        AS._SHUTTING_DOWN.clear()
+
+
+def test_an_ordinary_backend_death_still_gets_its_graceful_drain(monkeypatch):
+    """The no-wait path is for a known-broken engine only, not for every death."""
+    signals = []
+    monkeypatch.setattr(AS, "_GLOBAL_STATE", SimpleNamespace(backend_processes=[]))
+    monkeypatch.setattr(AS.os, "kill", lambda pid, sig: signals.append(sig))
+    monkeypatch.setattr(AS.signal, "SIGTERM", "TERM", raising=False)
+    AS._SHUTTING_DOWN.clear()
+    try:
+        timer = AS._exit_after_backend_death(0.01, force_grace_s=0.0)
+        assert _wait_for(lambda: bool(signals))
+        assert signals == ["TERM"]
+    finally:
+        timer.cancel()
+        AS._SHUTTING_DOWN.clear()

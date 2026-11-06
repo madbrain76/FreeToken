@@ -100,19 +100,23 @@ class LockedFetch {
     if (cpu >= 0) pin_this_thread(cpu);
     uint64_t seen = 0;
     auto last_active = fetch_clock::now();
+    int64_t sleep_us = 20;
     while (!stop_.load(std::memory_order_relaxed)) {
       const uint64_t gen = gen_.load(std::memory_order_acquire);
       if (gen == seen) {
-        if (fetch_clock::now() - last_active > kHotWindow)
-          std::this_thread::sleep_for(std::chrono::microseconds(50));
-        else
+        if (fetch_clock::now() - last_active < kHotWindow) {
           cpu_relax();
+        } else {
+          std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+          sleep_us = std::min<int64_t>(sleep_us * 2, 2000);
+        }
         continue;
       }
       seen = gen;
       run_jobs();
       finished_.fetch_add(1, std::memory_order_acq_rel);
       last_active = fetch_clock::now();
+      sleep_us = 20;
     }
   }
 

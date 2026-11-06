@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -42,6 +43,11 @@ from .reasoning_parser import (
     build_reasoning_parser,
     strip_special_tokens,
 )
+
+logger = logging.getLogger(__name__)
+
+# Template-facing key for a tool call whose arguments are not a JSON object.
+RAW_ARGUMENTS_KEY = "__raw_arguments__"
 
 
 class GenerationError(ValueError):
@@ -74,6 +80,12 @@ class ReasoningDelta:
 @dataclass
 class ContentDelta:
     text: str
+
+
+@dataclass
+class TokenCountDelta:
+    """Diagnostic stream event carrying exact newly generated token count."""
+    count: int
 
 
 @dataclass
@@ -115,6 +127,7 @@ class GenDone:
     completion_tokens: int
     matched_stop: str | None = None
     cached_tokens: int = 0
+    timings: dict[str, Any] | None = None
 
 
 GenEvent = ReasoningDelta | ContentDelta | ToolCallStart | ToolCallArgsDelta | ToolCallsDelta | GenDone
@@ -130,6 +143,46 @@ class GenResult:
     completion_tokens: int
     matched_stop: str | None = None
     cached_tokens: int = 0
+    timings: dict[str, Any] | None = None
+
+
+def timings_block(state: Any, timings: dict[str, Any] | None) -> dict[str, Any] | None:
+    """llama.cpp's per-request timings object (server_slot_stats::to_json, b10408+) as
+    frontends like llama-swap read it, plus queue_ms as a FreeToken extension. The spans
+    and counts are measured in the scheduler (ReqStats) and arrive on the terminal ack:
+    queue_ms covers waiting-queue admission to the first prefill chunk, prompt_ms the
+    first chunk to the first sampled token on the host, predicted_ms the first to the
+    last committed token. prompt_n counts only the evaluated tokens and the decode rates
+    divide by predicted_n - 1 steps (the first token rides the last prompt batch),
+    matching llama.cpp's arithmetic. Values are not rounded. Off unless
+    --enable-timings-report: usage.prompt_tokens - prompt_n would otherwise still
+    reveal the prefix-cache hit that --enable-cache-report hides."""
+    if timings is None:
+        return None
+    config = getattr(state, "config", None) if state is not None else None
+    if not getattr(config, "enable_timings_report", False):
+        return None
+    prompt_n = timings["prompt_n"]
+    predicted_n = timings["predicted_n"]
+    prompt_ms = timings["prompt_ms"]
+    predicted_ms = timings["predicted_ms"]
+    gen_steps = max(predicted_n - 1, 0)
+    block: dict[str, Any] = {
+        "cache_n": timings["cache_n"],
+        "prompt_n": prompt_n,
+        "prompt_ms": prompt_ms,
+        "prompt_per_token_ms": prompt_ms / prompt_n if prompt_n > 0 else 0.0,
+        "prompt_per_second": 1e3 / prompt_ms * prompt_n if prompt_ms > 0 else 0.0,
+        "predicted_n": predicted_n,
+        "predicted_ms": predicted_ms,
+        "predicted_per_token_ms": predicted_ms / gen_steps if gen_steps > 0 else 0.0,
+        "predicted_per_second": 1e3 / predicted_ms * gen_steps if predicted_ms > 0 else 0.0,
+        "queue_ms": timings["queue_ms"],
+    }
+    if timings.get("draft_n", 0) > 0:
+        block["draft_n"] = timings["draft_n"]
+        block["draft_n_accepted"] = timings["draft_n_accepted"]
+    return block
 
 
 @dataclass
@@ -228,16 +281,39 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
         for tc in tool_calls:
             tc = dict(tc)
             fn = dict(tc.get("function") or {})
-            arguments = fn.get("arguments")
-            if isinstance(arguments, str):
-                try:
-                    fn["arguments"] = json.loads(arguments)
-                except json.JSONDecodeError:
-                    pass
+            fn["arguments"] = _template_arguments(fn.get("arguments"), fn.get("name"))
             tc["function"] = fn
             rendered.append(tc)
         m["tool_calls"] = rendered
     return m
+
+
+def _template_arguments(arguments: Any, name: str | None = None) -> dict[str, Any]:
+    """Decode one tool call's arguments into the mapping a chat template iterates.
+
+    Absent or blank means no arguments. Anything that is not a JSON object -- typically a
+    call the tool parser truncated mid-arguments and the client later replays -- keeps its
+    text verbatim under ``RAW_ARGUMENTS_KEY``. Passing a string through, or rejecting it,
+    would abort every later turn that replays the call, not just this one.
+    """
+    if isinstance(arguments, dict):
+        return arguments
+    if arguments is None:
+        return {}
+    raw = arguments if isinstance(arguments, str) else str(arguments)
+    if not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        return parsed
+    logger.warning(
+        "tool call %s arguments are not a JSON object, rendering them verbatim: %s",
+        name or "(unnamed)", f"{raw[:120]!r}",
+    )
+    return {RAW_ARGUMENTS_KEY: raw}
 
 
 def _flatten_text_parts(parts: list[Any]) -> str | list[dict[str, Any]]:
@@ -410,6 +486,9 @@ def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
             or bool(ctk.get("enable_thinking"))
             or bool(ctk.get("thinking"))
         )
+    elif parser_name == "flint":
+        # Flint opens its own optional think block, including when tools are present.
+        force_reasoning = False
     elif parser_name == "minimax_m3":
         # M3's template pre-opens <mm:think> only in thinking_mode "enabled" (the
         # model then emits just the closing tag); "adaptive" (default) leaves the
@@ -696,12 +775,17 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
 
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
+    timings: dict[str, Any] | None = None
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
             raise GenerationError(ack.error, getattr(ack, "error_code", None))
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
+        if ack.completion_tokens_delta:
+            yield TokenCountDelta(ack.completion_tokens_delta)
+        if getattr(ack, "timings", None) is not None:
+            timings = ack.timings
         content_delta = ack.incremental_output
         if reasoning_parser is not None and content_delta:
             reasoning_delta, content_delta = reasoning_parser.parse_stream_chunk(content_delta)
@@ -784,6 +868,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     yield GenDone(
         finish_reason, prompt_tokens, completion_tokens,
         matched_stop=engine_matched_stop, cached_tokens=cached_tokens,
+        timings=timings,
     )
 
 
@@ -794,6 +879,7 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
+    timings: dict[str, Any] | None = None
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
     async for ack in state.wait_for_ack(uid):
@@ -802,6 +888,8 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
+        if getattr(ack, "timings", None) is not None:
+            timings = ack.timings
         full_content += ack.incremental_output
         if ack.finished:
             engine_finish_reason = getattr(ack, "finish_reason", None)
@@ -828,4 +916,5 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         completion_tokens=completion_tokens,
         matched_stop=engine_matched_stop,
         cached_tokens=cached_tokens,
+        timings=timings,
     )

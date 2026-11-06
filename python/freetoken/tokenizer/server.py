@@ -19,6 +19,10 @@ from freetoken.message import (
     CacheRebuildResultMsg,
     DetokenizeMsg,
     ErrorReplyMsg,
+    FlushCacheBackendMsg,
+    FlushCacheMsg,
+    FlushCacheReply,
+    FlushCacheResultMsg,
     PromptAdmittedMsg,
     TokenizeMsg,
     UserMsg,
@@ -214,10 +218,25 @@ def tokenize_worker(
                             error=m.error,
                         )
                     )
+                elif isinstance(m, FlushCacheMsg):
+                    send_backend.put(
+                        FlushCacheBackendMsg(request_id=m.request_id, timeout=m.timeout)
+                    )
+                elif isinstance(m, FlushCacheResultMsg):
+                    send_frontend.put(
+                        FlushCacheReply(request_id=m.request_id, status=m.status, error=m.error)
+                    )
             n_control = sum(
                 isinstance(
                     m,
-                    (CacheRebuildMsg, CacheRebuildResultMsg, ErrorReplyMsg, PromptAdmittedMsg),
+                    (
+                        CacheRebuildMsg,
+                        CacheRebuildResultMsg,
+                        FlushCacheMsg,
+                        FlushCacheResultMsg,
+                        ErrorReplyMsg,
+                        PromptAdmittedMsg,
+                    ),
                 )
                 for m in pending_msg
             )
@@ -235,7 +254,7 @@ def tokenize_worker(
                         finished=msg.finished,
                         finish_reason=msg.finish_reason,
                         matched_stop=msg.matched_stop,
-                        completion_tokens_delta=1,
+                        completion_tokens_delta=len(msg.next_tokens),
                         kv_used_pages=msg.kv_used_pages,
                         kv_total_pages=msg.kv_total_pages,
                         mamba_used_slots=msg.mamba_used_slots,
@@ -243,6 +262,7 @@ def tokenize_worker(
                         swa_used_tokens=msg.swa_used_tokens,
                         swa_total_tokens=msg.swa_total_tokens,
                         gpu_mem_bytes=msg.gpu_mem_bytes,
+                        timings=msg.timings,
                     )
                     for msg, reply in zip(detokenize_msg, replies, strict=True)
                 ]

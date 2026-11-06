@@ -50,15 +50,16 @@ def test_hybrid_cache_manager_donate_then_hit():
     cm.lock(mr.cuda_handle)
 
     free_before = pool.num_free_slots
-    cm.cache_req(reqA, finished=False)       # donate pp[0] at boundary 4; replace it in the pair
-    # pp[0] donated to the tree; a fresh replacement was alloc'd -> net free-slot count unchanged
-    assert pool.num_free_slots == free_before - 1  # one replacement alloc'd (donated slot now tree-owned)
-    assert reqA.mamba_ping_pong[0] != pp[0]        # slot 0 replaced; pp[0] now lives in the tree
+    cm.cache_req(reqA, finished=False)       # the tree receives a private clone of pp[0]
+    # One slot leaves the pool for the tree, and the request is never made to replace a buffer
+    # it still owns: the clone costs the same as the old transfer-plus-replacement did.
+    assert pool.num_free_slots == free_before - 1  # the clone is now the tree's slot
+    assert tuple(reqA.mamba_ping_pong) == pp       # the request kept both of its own buffers
 
     # req B shares the [1,2,3,4] prefix -> HIT: returns the donated snapshot + reused KV
     mrB = cm.match_req(_pend([1, 2, 3, 4, 9]))
     assert mrB.cuda_handle.cached_len == 4
-    assert mrB.mamba_value == pp[0]
+    assert mrB.mamba_value not in (live, pp[0], pp[1])   # the tree never owns a request's slot
     assert mrB.cuda_handle.get_matched_indices().tolist() == [100, 101, 102, 103]
 
 
@@ -76,10 +77,99 @@ def test_hybrid_finish_donates_live_slot():
     req.linear_slot_idx, req.mamba_ping_pong = live, pp
     cm.lock(mr.cuda_handle)
 
-    cm.cache_req(req, finished=True)         # donate the live slot directly (final state)
-    # ping-pong pair freed; live slot kept (now owned by the tree)
+    free_before = pool.num_free_slots
+    cm.cache_req(req, finished=True)         # the tree receives a private clone of `live`
+    # live + both ping-pong slots return to the pool, and the clone the tree keeps costs one.
+    assert pool.num_free_slots == free_before + 2
     mr2 = cm.match_req(_pend([7, 8, 9, 10]))
-    assert mr2.cuda_handle.cached_len == 3 and mr2.mamba_value == live
+    assert mr2.cuda_handle.cached_len == 3 and mr2.mamba_value not in (live, *pp)
+
+
+def _marker(pool, slot: int, value: float) -> None:
+    pool.conv_states[:, slot] = value
+    pool.recurrent_states[:, slot] = value
+
+
+def test_a_donated_snapshot_is_a_private_clone_a_late_write_cannot_reach():
+    """PR #287: a snapshot the tree shares with a live pipeline never heals.
+
+    Donating the request's OWN slot left one slot id owned by both the tree and a still-in-flight
+    step (overlap keeps a finishing request for one more decode), so a late write through the
+    retained alias corrupted the tree's copy, and every later hit of that branch resumed the
+    corrupted state until the process restarted.
+    """
+    pool = _pool()
+    pt = torch.zeros(4, 64, dtype=torch.int32)
+    cm = CacheManager(64, 1, pt, "hybrid_radix", linear_state_pool=pool)
+    mr = cm.match_req(_pend([7, 8, 9, 10]))
+    live, pp = pool.alloc(1)[0], tuple(pool.alloc(2))
+    pt[1, :3] = torch.tensor([200, 201, 202], dtype=torch.int32)
+    req = Req(input_ids=torch.tensor([7, 8, 9, 10], dtype=torch.int32), table_idx=1,
+              cached_len=3, output_len=1, uid=1, sampling_params=SamplingParams(),
+              cache_handle=mr.cuda_handle)
+    req.linear_slot_idx, req.mamba_ping_pong = live, pp
+    cm.lock(mr.cuda_handle)
+    _marker(pool, live, 3.0)
+
+    cm.cache_req(req, finished=True)
+    snapshot = cm.match_req(_pend([7, 8, 9, 10])).mamba_value
+    assert snapshot != live
+    assert torch.equal(pool.recurrent_states[:, snapshot], pool.recurrent_states[:, live])
+
+    # The alias is severed: the request's own slot may still be written by a late step, and the
+    # tree's snapshot -- what every later hit restores -- must not move.
+    _marker(pool, live, float("nan"))
+    assert not bool(torch.isnan(pool.recurrent_states[:, snapshot]).any())
+    assert not bool(torch.isnan(pool.conv_states[:, snapshot]).any())
+
+
+def test_a_poisoned_request_publishes_nothing_and_returns_cleared_slots():
+    """A request a breaker failed must not become a prefix, on either tier."""
+    pool = _pool(host_slots=4)
+    pt = torch.zeros(4, 64, dtype=torch.int32)
+    cm = CacheManager(64, 1, pt, "hybrid_radix", linear_state_pool=pool)
+    mr = cm.match_req(_pend([11, 12, 13, 14]))
+    live, pp = pool.alloc(1)[0], tuple(pool.alloc(2))
+    pt[2, :3] = torch.tensor([210, 211, 212], dtype=torch.int32)
+    req = Req(input_ids=torch.tensor([11, 12, 13, 14], dtype=torch.int32), table_idx=2,
+              cached_len=3, output_len=1, uid=2, sampling_params=SamplingParams(),
+              cache_handle=mr.cuda_handle)
+    req.linear_slot_idx, req.mamba_ping_pong = live, pp
+    req.mamba_host_tracks = [(2, pool.alloc_host(1)[0])]
+    cm.lock(mr.cuda_handle)
+    _marker(pool, live, float("nan"))
+    before = pool.num_free_slots
+
+    req.generation_poisoned = True
+    cm.cache_req(req, finished=True)         # routed to discard_req
+
+    assert cm.match_req(_pend([11, 12, 13, 14])).cuda_handle.cached_len == 0, "nothing published"
+    assert pool.num_free_slots == before + 3  # live + both ping-pong are back
+    # The pool hands the slot out again only in a state a new request can start from.
+    reused = pool.alloc(1)[0]
+    assert not bool(torch.isnan(pool.recurrent_states[:, reused]).any())
+    assert not bool(torch.isnan(pool.conv_states[:, reused]).any())
+    assert pool.num_free_host_slots == 3      # the bank slot came back too
+
+
+def test_copy_on_donate_can_be_turned_off(monkeypatch):
+    """The escape hatch for an A/B: transfer semantics, exactly as before PR #287."""
+    from freetoken.env import ENV
+
+    monkeypatch.setattr(ENV.LINEAR_STATE_COPY_ON_DONATE, "value", False)
+    pool = _pool()
+    pt = torch.zeros(4, 64, dtype=torch.int32)
+    cm = CacheManager(64, 1, pt, "hybrid_radix", linear_state_pool=pool)
+    mr = cm.match_req(_pend([21, 22, 23, 24]))
+    live, pp = pool.alloc(1)[0], tuple(pool.alloc(2))
+    pt[3, :3] = torch.tensor([220, 221, 222], dtype=torch.int32)
+    req = Req(input_ids=torch.tensor([21, 22, 23, 24], dtype=torch.int32), table_idx=3,
+              cached_len=3, output_len=1, uid=3, sampling_params=SamplingParams(),
+              cache_handle=mr.cuda_handle)
+    req.linear_slot_idx, req.mamba_ping_pong = live, pp
+    cm.lock(mr.cuda_handle)
+    cm.cache_req(req, finished=True)
+    assert cm.match_req(_pend([21, 22, 23, 24])).mamba_value == live   # transferred, not cloned
 
 
 def test_free_req_slots_idempotent():

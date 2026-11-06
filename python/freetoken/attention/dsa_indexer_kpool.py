@@ -56,8 +56,8 @@ class Glm5NextDSABackend(DSAAttnBackend):
     # ----- CUDA-graph decode staging ------------------------------------------------------
     # The tail rings are keyed by Req.table_idx; a captured decode step must read it
     # from a static buffer restaged per replay (rows/kvlen precedent in the parent).
-    def init_capture_graph(self, max_seq_len: int, bs_list) -> None:
-        super().init_capture_graph(max_seq_len, bs_list)
+    def init_capture_graph(self, max_seq_len: int, bs_list, rows_per_req: int = 1) -> None:
+        super().init_capture_graph(max_seq_len, bs_list, rows_per_req)
         self._slots_buf = torch.zeros(max(bs_list), dtype=torch.int64, device=self.device)
 
     def _stage_decode(self, batch: "Batch", bs: int, table_idx: torch.Tensor) -> None:
@@ -243,7 +243,10 @@ class Glm5NextDSABackend(DSAAttnBackend):
             md.sel.clear()
             md.sel[layer_id] = (sel, cnt)
         sel, cnt = md.sel[self._leader[layer_id]]
-        q_cat = torch.cat([q_nope, q_pe], dim=-1).view(bs, 1, self.num_heads, self.latent_dim)
+        if q_pe.shape[-1] == 0:  # NoPE: the cat would be a full-width copy
+            q_cat = q_nope.unsqueeze(1)
+        else:
+            q_cat = torch.cat([q_nope, q_pe], dim=-1).view(bs, 1, self.num_heads, self.latent_dim)
         o = self._attend(q_cat, layer_id, sel, cnt)
         return o.view(bs, self.num_heads, self.kv_lora_rank)
 

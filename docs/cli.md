@@ -46,7 +46,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--max-running-requests` | 4 | Max concurrently running requests |
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
-| `--max-prefill-length` | 8192 | Chunked-prefill chunk size in tokens |
+| `--max-prefill-length` | 8192 | Chunked-prefill chunk size in tokens; with offloaded experts see [performance/prefill.md](performance/prefill.md) |
 | `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
 
@@ -71,6 +71,7 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 |---|---|---|
 | `--memory-ratio` | 0.9 | Fraction of free VRAM the engine may use (weights + MoE cache + KV) |
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
+| `--embed-weights` | gpu | Where the input token embedding table lives. `host` keeps it in pinned host RAM and each lookup reads its rows over PCIe, so its VRAM goes to the expert cache and KV. Refused when the table is tied to the LM head |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--embed-device` | gpu | `cpu` keeps the input-embedding table in pinned host RAM; the GPU reads the looked-up rows over PCIe, and the freed VRAM goes to the KV cache (2.37 GiB on Qwen3.8-27B). Decode reads one row per token, so speed is unchanged. A table tied to the LM head stays on the GPU |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
@@ -106,7 +107,7 @@ trade-offs:
 
 ### MoE offload
 
-See [models.md](models.md#moe-strategies) for what each strategy does.
+See [models.md](models.md#moe-strategies) for what each strategy does, [performance/prefill.md](performance/prefill.md) for prefill speed, and [performance/decode.md](performance/decode.md) for decode speed.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -118,7 +119,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--moe-cache-split` | equal | How the pools share the slots: `equal` (in proportion to their layer counts), or `profile:<path>`: every pool keeps `top_k` slots and the rest go to the most used experts in the profile's per-layer expert counts. With `offload`, a pool smaller than the expert count lowers `--max-running-requests` to its slots / top_k |
 | `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
-| `--moe-cpu-layers` | all on GPU | With `offload`/`hybrid`: which MoE layers decode on CPU (`3,7,11`, a count, a fraction, or `auto`). `auto` is for hosts that cap CUDA pinned memory (Windows/WSL): it pins layers from the middle out until CUDA refuses one and OS-locks the rest, see [models.md](models.md#hosts-that-cap-pinned-memory-wsl); every value needs an expert format the CPU executor serves (bf16, fp8_block, nvfp4, mxfp4, GGUF on x86 CPUs) |
+| `--moe-cpu-layers` | all on GPU | With `offload`/`hybrid`: which MoE layers decode on CPU (`3,7,11`, a count, a fraction, or `auto`). `auto` is for hosts that cap CUDA pinned memory (Windows/WSL): it pins layers from the middle out until CUDA refuses one and OS-locks the rest (`FREETOKEN_PIN_BUDGET_GB` and FTW checkpoints lock from a size estimate instead), see [models.md](models.md#hosts-that-cap-pinned-memory-wsl); every value needs an expert format the CPU executor serves (bf16, fp8_block, nvfp4, mxfp4, GGUF on x86 CPUs, except gpt-oss GGUF files whose per-expert biases decode on the GPU only) |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-demand-tokens` | 0 | Prefill: a chunk of at most this many tokens loads only the experts it routes to, through the expert cache as decode does (GPU decode only); 0 streams whole layers |
 | `--moe-locked-fetch` | auto | With `hybrid` and locked layers: share of a locked layer's misses fetched per step into its GPU slots through pinned staging. Auto takes p / (2p + c) from the `ft bench bw` row of the layer's kind (at most 1 per step without a row); 0 = locked layers decode on CPU only |
@@ -126,6 +127,16 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--moe-collect-stats` | off | Log decode MoE stats with each decode log line: hit rate, and per layer-step the misses, experts fetched and experts computed on CPU, for pinned, locked and CPU-only layers |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
+
+### Speculative decoding
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--speculative-algorithm`, `--spec-algo` | off | Draft method. `mtp` drafts with the checkpoint's multi-token-prediction layer: Qwen3.5 / Qwen3.6 HF or GGUF checkpoints, and Qwen3.8-Flash-Next HF or GGUF |
+| `--speculative-num-steps`, `--spec-num-steps` | the method's default (3 for `mtp`) | Draft tokens per decode step, 1 to 8 for `mtp` |
+| `--speculative-draft-model-path`, `--spec-draft-model` | the target checkpoint | Where the draft weights load from. A Qwen3.8-Flash-Next target also takes a Strata MTP pack (a GGUF that keeps the checkpoint's `mtp.*` tensors under their HF names), and a Qwen3.8-Flash-Next GGUF target needs one; a Qwen3.5 / Qwen3.6 GGUF target drafts from its own `nextn` MTP block (the block llama.cpp keeps after the last decoder layer), or from an `mtp-*.gguf` sidecar of the same model (unsloth's `MTP/` releases) given here; a separate checkpoint folder is an HF-target option, read with the target's quantization config, and a GGUF target refuses a folder draft |
+
+Speculative decoding needs `--tp 1` and runs without overlap scheduling; targets with sliding-window or DSV4 window-tier KV are refused at startup. `mtp` refuses an FTW checkpoint as the draft source, since FTW drops the `mtp.*` tensors, and a Qwen3.5 / Qwen3.6 GGUF converted without its MTP layer (llama.cpp `--no-mtp`) when no `mtp-*.gguf` sidecar is given: such a trunk has no draft of its own to read, while a `--no-mtp` trunk plus a sidecar works (the trunk config's shapes, the sidecar's weights).
 
 ### API behaviour
 
@@ -135,7 +146,22 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--tool-call-parser` | auto | Tool-call format; auto-inferred from the model family |
 | `--reasoning-parser` | auto | Splits chain-of-thought into `reasoning_content`; auto-inferred; `off` disables |
 | `--enable-cache-report` | off | Report prefix-cache hits in each response's usage block |
+| `--enable-timings-report` | off | Attach a llama.cpp-shaped per-request `timings` object to responses |
 | `--anthropic-inline-system` | auto | Placement of late Anthropic system instructions: `auto`, `preserve`, or `fold` |
+
+With `--enable-timings-report` every chat completion, completion and Responses response
+also carries a llama.cpp-shaped `timings` object next to `usage` (`cache_n`, `prompt_n`,
+`prompt_ms`, `prompt_per_token_ms`, `prompt_per_second`, `predicted_n`, `predicted_ms`,
+`predicted_per_token_ms`, `predicted_per_second`, plus `queue_ms` as a FreeToken
+extension and `draft_n` / `draft_n_accepted` under speculative decoding), so frontends
+like llama-swap and Open Web UI show per-request prefill/decode rates. All spans are
+measured in the scheduler: `queue_ms` covers admission to the first prefill chunk,
+`prompt_ms` the first chunk to the first sampled token (chunk gaps included),
+`predicted_ms` the first to the last committed token; `prompt_n` counts only the
+evaluated tokens and the decode rates divide by `predicted_n - 1`, as in llama.cpp. On
+streams the object rides the final chunk; a multi-prompt `/v1/completions` request
+reports the first prompt's spans, as llama.cpp does. `/v1/messages` never carries it
+(llama.cpp emits no timings there either).
 
 ### Image input
 
@@ -152,6 +178,7 @@ so a client can gate its attachment controls without reading the checkpoint conf
 | --- | --- | --- |
 | `--text-model-only` | off | Serve a multimodal checkpoint text-only: no encoder tower is built (its VRAM goes to the KV/expert pools) and every multimodal input is rejected. Same as `--mm-disable` with every encoder kind |
 | `--mm-disable` | none | Encoder towers to leave unbuilt (`vision`, `audio`); every input they would serve is rejected |
+| `--mmproj` | found next to the model | GGUF models only: the llama.cpp vision tower file (`mmproj-*.gguf`), see [Image input](models.md#image-input). Without it, FreeToken takes a `*mmproj*.gguf` that fits the model (output width, tower type, image tokens) from the model file's own folder, BF16 before F32, F16 and quantized files. With none, or with files of several models it cannot tell apart, the model serves text only; a repo that keeps each quant in a subfolder and the mmproj at the top needs `--mmproj`. The log names the file it loads |
 | `--mm-encoder-weights` | host | Where the encoder tower's block weights live. `host` streams them from pinned host banks two blocks at a time behind the compute, so the GPU holds two blocks instead of the whole tower; small images pay the copy time, large ones hide it behind the compute. `gpu` keeps them resident. An encoder without a block stack stays resident either way. `cpu` (Qwen VL families) keeps the whole tower in host RAM and runs it in FP32 in a separate CPU process before a request reaches the GPUs: no VRAM at all, see [CPU vision encoder](#cpu-vision-encoder) |
 | `--mm-encoder-threads` | one NUMA node's cores | `--mm-encoder-weights cpu`: torch threads of the encoder process. Defaults to the CPUs of `--mm-encoder-cpus`, else the physical cores of one NUMA node |
 | `--mm-encoder-cpus` | not pinned | `--mm-encoder-weights cpu`: CPU list the encoder process is pinned to, as `taskset` spells it (`22-43`, `0-3,8`) |

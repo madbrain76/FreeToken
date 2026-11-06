@@ -57,9 +57,12 @@ class BackendHandle:
 
 
 class WorkerDied(Exception):
-    def __init__(self, message: str) -> None:
+    def __init__(self, message: str, exitcode: int | None = None) -> None:
         super().__init__(message)
         self.message = message
+        # The worker's own exit status, when the process gave one. It is how a caller tells a
+        # deliberate engine give-up (the storm breaker) from a crash worth draining for.
+        self.exitcode = exitcode
 
 
 def _first_dead(processes: List[Any]) -> Any | None:
@@ -124,7 +127,10 @@ def drain_ready(
                 # The worker may have pushed its real failure reason just before exiting; give
                 # the queue a brief window to surface it, else fall back to the generic message.
                 reason = _drain_pending_error(get)
-                raise WorkerDied(reason or f"backend worker {getattr(dead, 'name', '?')} exited during load")
+                raise WorkerDied(
+                    reason or f"backend worker {getattr(dead, 'name', '?')} exited during load",
+                    exitcode=getattr(dead, "exitcode", None),
+                )
             continue
         err = _as_error(msg)
         if err is not None:
@@ -139,11 +145,27 @@ def drain_ready(
             ready += 1
 
 
+def _report_failure(
+    on_failure: Callable[..., None], message: str, exitcode: int | None
+) -> None:
+    """Hand the caller the death, with the worker's exit status when there is one to report.
+
+    The keyword is only passed when a status exists, so a caller written against the plain
+    ``on_failure(message)`` contract keeps working for ordinary deaths.
+    """
+    if exitcode is None:
+        on_failure(message)
+    else:
+        on_failure(message, exitcode=exitcode)
+
+
 def run_backend_supervisor(
     handle: BackendHandle,
     progress: LoadProgress,
     on_ready: Callable[[], None],
     on_failure: Callable[[str], None] | None = None,
+    # ... may also be invoked as on_failure(message, exitcode=...): the extra keyword carries the
+    # dead worker's exit status, so the frontend can recognise a deliberate engine give-up.
     poll: float = 1.0,
     on_meta: Callable[[dict], None] | None = None,
     is_shutting_down: Callable[[], bool] | None = None,
@@ -169,7 +191,7 @@ def run_backend_supervisor(
     except WorkerDied as exc:
         # A worker dying mid-load during an orderly shutdown is expected, not a load failure.
         if not _shutting_down() and on_failure is not None:
-            on_failure(exc.message)
+            _report_failure(on_failure, exc.message, exc.exitcode)
         return
 
     on_ready()
@@ -181,6 +203,10 @@ def run_backend_supervisor(
                 # Orderly stop in progress: the worker exit is expected — stay quiet.
                 return
             if on_failure is not None:
-                on_failure(f"backend worker {getattr(dead, 'name', '?')} exited")
+                _report_failure(
+                    on_failure,
+                    f"backend worker {getattr(dead, 'name', '?')} exited",
+                    getattr(dead, "exitcode", None),
+                )
             return
         time.sleep(poll)

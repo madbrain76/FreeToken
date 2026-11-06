@@ -557,7 +557,7 @@ def test_adjust_config_converts_moe_cache_rate_to_cache_size(monkeypatch):
         model_path="/tmp/freetoken-test-model",
         tp_info=DistributedInfo(rank=0, size=1),
         dtype=torch.float16,
-        attention_backend="fi",
+        attention_backend="triton" if torch.version.hip is not None else "fi",
         moe_cache_rate=0.3,
     )
     object.__setattr__(
@@ -645,7 +645,7 @@ def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
         events.append("graph_exit")
 
     class FakeAttnBackend:
-        def init_capture_graph(self, max_seq_len, bs_list):
+        def init_capture_graph(self, max_seq_len, bs_list, rows_per_req=1):
             pass
 
         def prepare_for_capture(self, batch):
@@ -667,6 +667,7 @@ def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
     monkeypatch.setattr("torch.cuda.empty_cache", lambda: None)
     monkeypatch.setattr("torch.cuda.reset_peak_memory_stats", lambda device=None: None)
     monkeypatch.setattr("freetoken.engine.graph.get_free_memory", lambda device: 1024)
+    monkeypatch.setattr("freetoken.engine.graph._upload_graph", lambda graph, stream: None)
 
     dummy_req = Req(
         input_ids=torch.tensor([0], dtype=torch.int32),
@@ -680,13 +681,12 @@ def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
     GraphRunner(
         stream=None,
         device=torch.device("cpu"),
-        model=FakeModel(),
+        forward=FakeModel().forward,
         attn_backend=FakeAttnBackend(),
         cuda_graph_bs=[1],
         cuda_graph_max_bs=None,
         free_memory=1024,
         max_seq_len=1,
-        vocab_size=3,
         dummy_req=dummy_req,
         moe_offload_cache=FakeOffloadCache(),
     )
@@ -1090,6 +1090,98 @@ def test_slot_pools_keep_each_layer_in_its_own_slots(target):
     assert [v[0].shape[0] for v in map(cache.pool_bank_views, range(L))] == [8, 8, 24]
 
 
+def _hybrid_ensure_reference(st, layer, ids, weights, num_experts, pool, frac, mode, kernel_fetch):
+    """One hybrid ensure call on CPU copies of the cache state, written from the LRU contract."""
+    base, size = pool
+    step = int(st["step"]) + 1
+    slot_for_id, recency = st["slot_for_id"], st["expert_recency"]
+    p_ids, p_usage = st["id_of_slot"][base : base + size], st["usage"][base : base + size]
+    active = sorted(set(ids.tolist()))
+    hits = [e for e in active if slot_for_id[layer, e] >= 0]
+    missing = [e for e in active if slot_for_id[layer, e] < 0]
+    m, fq = len(missing), min(1 << 16, max(0, round(frac * (1 << 16))))
+    lo, room = (m * fq) >> 16, size - len(hits)
+    if mode == "min-wait":
+        cost_lo = max(lo * ((1 << 16) - fq), (m - lo) * fq)
+        cost_hi = max((lo + 1) * ((1 << 16) - fq), (m - lo - 1) * fq)
+        num_fetch = min(m, lo if cost_lo <= cost_hi else lo + 1, room)
+    elif mode == "prefer-fetch":
+        num_fetch = min(m, (m * fq + 0xFFFF) >> 16, room)
+    else:
+        allowed = {min(m, lo, room)} if (m * fq) & 0xFFFF == 0 else {min(m, lo, room), min(m, lo + 1, room)}
+        assert kernel_fetch in allowed
+        num_fetch = kernel_fetch
+    taken = torch.zeros(size, dtype=torch.bool)
+    for e in hits:
+        p_usage[slot_for_id[layer, e]] = step
+        taken[slot_for_id[layer, e]] = True
+    plan = []
+    for e in sorted(missing, key=lambda e: (-int(recency[layer, e]), e))[:num_fetch]:
+        victim = int(torch.argmin(p_usage.masked_fill(taken, torch.iinfo(torch.int64).max)))  # first minimum
+        old = int(p_ids[victim])
+        if old >= 0:
+            slot_for_id.view(-1)[old] = -1
+        p_ids[victim] = layer * num_experts + e
+        slot_for_id[layer, e] = victim
+        p_usage[victim] = step
+        taken[victim] = True
+        plan.append((victim, e))
+    recency[layer, active] = step
+    st["step"] = torch.tensor(step)
+    slots = slot_for_id[layer, ids.long()]
+    on_gpu = slots >= 0
+    return st, plan, slots, torch.where(on_gpu, -1, ids), torch.where(on_gpu, weights, 0.0), m, active
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("mode", ["min-wait", "stochastic", "prefer-fetch"])
+@pytest.mark.parametrize("clamp", [False, True])
+@pytest.mark.parametrize("layout", ["global", "global-tiled", "per-layer"])
+def test_hybrid_ensure_matches_lru_reference(monkeypatch, layout, clamp, mode):
+    from freetoken.moe import offload_kernels
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    monkeypatch.setattr(offload_kernels, "_HYBRID_FETCH_ROUND", offload_kernels._HYBRID_FETCH_ROUNDING[mode])
+    torch.manual_seed(0)
+    # global-tiled: more slots than one Phase 2 tile, so victims come from the tiled scan
+    L, E, top_k = (20, 512, 10) if layout == "global-tiled" else (4, 128, 8)
+    size = {"global": 300, "global-tiled": offload_kernels._HYBRID_EVICT_CHUNK + 808, "per-layer": 4 * 96}[layout]
+    pools = {"pool_of_layer": list(range(L)), "pool_sizes": [96] * L} if layout == "per-layer" else {}
+    cache = OffloadMoeCache(
+        num_layers=L, num_experts=E, cache_size=size, device=torch.device("cuda"),
+        decode_target="hybrid", hybrid_max_fetch=1, **pools,
+    )
+    popularity = 1.0 / torch.arange(1, E + 1, dtype=torch.float64) ** 0.6
+    names = ["slot_for_id", "id_of_slot", "usage", "step", "expert_recency"]
+
+    # fetch every miss until every pool is full, then the benched-style fraction
+    for frac, calls in ((1.0, 4000), (0.413, 60 * L)):
+        for call in range(calls):
+            layer = call % L
+            if frac == 1.0 and bool((cache.id_of_slot >= 0).all()) and layer == 0:
+                break
+            cache.hybrid_fetch_fraction = [frac] * L
+            ids = torch.cat([torch.multinomial(popularity, top_k) for _ in range(2)]).to(torch.int32)
+            weights = torch.rand(ids.numel())
+            st = {n: getattr(cache, n).cpu().clone() for n in names}
+            p = cache.pool_of_layer[layer]
+            routes = cache.ensure_experts_hybrid(layer, ids.cuda(), weights.cuda(), clamp=clamp)
+            n = int(cache.num_indices)
+            st, plan, slots, cpu_ids, gpu_w, m, active = _hybrid_ensure_reference(
+                st, layer, ids, weights, E, (cache.pool_bases[p], cache.pool_sizes[p]), frac, mode, n
+            )
+            assert int(cache.num_missing_full) == m and n == len(plan)
+            assert cache.evict_slots[:n].cpu().tolist() == [v for v, _ in plan]
+            assert cache.src_indices[:n].cpu().tolist() == [e for _, e in plan]
+            assert torch.equal(routes.gpu_slots.cpu(), slots.clamp(min=0) if clamp else slots)
+            assert torch.equal(routes.cpu_ids.cpu(), cpu_ids) and torch.equal(routes.gpu_w.cpu(), gpu_w)
+            assert cache.active_mask.cpu().nonzero().flatten().tolist() == active
+            for name in names:
+                assert torch.equal(getattr(cache, name).cpu(), st[name]), name
+        assert bool((cache.id_of_slot >= 0).all())
+
+
 def _make_split_cache(num_layers=2, locked=(1,), prefill_overlap=False, device="cpu"):
     """A [gate_up, down] bf16 cache with the given layers LOCKED (rest pinned)."""
     from freetoken.moe.host_banks import HostResidency
@@ -1207,14 +1299,18 @@ def test_locked_hybrid_layer_fetches_through_staging_in_a_graph(monkeypatch, mem
     # memops: the GPU waits on the doorbell with a stream memop, else the gather kernel spins on it
     from types import SimpleNamespace
 
-    from freetoken.moe.locked_fetch import LockedLayerFetch
+    from freetoken.moe.locked_fetch import attach_locked_fetch, settle_banks
 
     monkeypatch.setenv("FREETOKEN_LOCKED_FETCH_THREADS", "2")
     torch.manual_seed(0)
     cache, sources = _make_split_cache(num_layers=2, locked=(1,), device="cuda")
     cache.decode_target = "hybrid"
     cache.locked_hybrid = frozenset({1})
-    cache.locked_fetch = LockedLayerFetch(cache, [1], plan={1: (0, 1.0)}, max_fetch=2, executor=SimpleNamespace(core_ids=[], _coord_core=-1, _flag_sync=memops))
+    config = SimpleNamespace(moe_strategy="hybrid", moe_locked_fetch=1.0, moe_locked_max_fetch=2)
+    _, _, staging = settle_banks(config, SimpleNamespace(sources=sources), probe=False, has_locked=True)
+    assert staging is not None
+    cache.cpu_executor = SimpleNamespace(core_ids=[], _coord_core=-1, _flag_sync=memops)
+    attach_locked_fetch(cache, config, staging, layer_rows=None)
 
     top_k = 3
     ids = torch.zeros(top_k, dtype=torch.int32, device="cuda")
@@ -1376,3 +1472,36 @@ def test_lock_failure_downgrades_echoed_residency(monkeypatch):
         with hb.PinPipeline() as pins:
             pins(1, {"gate_up": hb.HostBank((4,), torch.uint8)})
     assert plan2.actual == {1: hb.HostResidency.PAGEABLE.value}
+
+
+def test_host_ram_fits_parallel_sizes_subdirectory_shards(tmp_path, monkeypatch):
+    """The RAM probe must size the shards the reader will actually open, indexed subdirectory layouts included."""
+    import builtins
+    import io
+    import json
+
+    from freetoken.moe.expert_banks import _host_ram_fits_parallel
+
+    sub = tmp_path / "tensors"
+    sub.mkdir()
+    for i in (1, 2):
+        (sub / f"model-{i:05d}-of-00002.safetensors").write_bytes(b"x" * (1 << 20))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.layers.0.mlp.experts.0.gate_proj.weight": "tensors/model-00001-of-00002.safetensors",
+                    "model.layers.0.mlp.experts.0.down_proj.weight": "tensors/model-00002-of-00002.safetensors",
+                }
+            }
+        )
+    )
+    real_open = builtins.open
+
+    def fake_open(file, *args, **kwargs):
+        if str(file) == "/proc/meminfo":
+            return io.StringIO("MemAvailable:           512 kB\n")
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    assert not _host_ram_fits_parallel(str(tmp_path))

@@ -34,9 +34,8 @@ class EngineConfig:
     quant_backend: str | None = None
     # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
     ple_backend: str = "disk"
-    # --embed-device: "cpu" keeps the untied input-embedding table in pinned host RAM, read by
-    # the GPU in place over PCIe (a few rows per decode step); its VRAM goes to the KV pool.
-    embed_device: str = "gpu"
+    # --embed-weights: "gpu" (default) keeps the input embedding tables in VRAM; "host" keeps the untied ones in pinned host RAM, read zero-copy by the lookup.
+    embed_weights: str = "gpu"
     # DeepSeek-V4.1 Decoder SWA Bounded Replay: "bounded" (default) runs the decoder layers on each
     # prompt's last window; "exact" runs them on every token.
     swa_decoder_replay: str = "bounded"
@@ -64,8 +63,9 @@ class EngineConfig:
     moe_prefill_demand_tokens: int = 0
     moe_prefill_overlap: bool = True
     # Prefill hit/miss split: serve cache-resident experts D2D during prefill
-    # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 12.8
-    # (cudaMemcpyBatchAsync); no-op unless moe_cache_size > 2 * num_experts.
+    # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 13.0
+    # (cudaMemcpyBatchAsync) or HIP (hipMemcpyBatchAsync);
+    # no-op unless moe_cache_size > 2 * num_experts.
     moe_prefill_hit_d2d: bool = False
     moe_preseed: bool | None = None
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
@@ -127,6 +127,10 @@ class EngineConfig:
     step_timeout: float = 120.0  # operational step execution timeout (seconds)
     use_dummy_weight: bool = False
     use_pynccl: bool = True
+    # speculative decoding
+    speculative_algorithm: str | None = None
+    speculative_num_steps: int = 0
+    speculative_draft_model_path: str | None = None
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
@@ -138,6 +142,9 @@ class EngineConfig:
     def __post_init__(self):
         if not (self.moe_locked_fetch == -1 or 0.0 <= self.moe_locked_fetch <= 1.0):
             raise ValueError(f"moe_locked_fetch must be -1 (auto) or in [0, 1], got {self.moe_locked_fetch}")
+        if self.moe_locked_fetch > 0 and round(self.moe_locked_fetch * (1 << 16)) == 0:
+            # the ensure kernel takes the share in Q16: this one rounds to 0 and the layers would never fetch
+            raise ValueError(f"moe_locked_fetch {self.moe_locked_fetch} rounds to 0 in Q16; pass 0 to keep locked layers CPU-only")
         if self.moe_locked_max_fetch < 1:
             raise ValueError(f"moe_locked_max_fetch must be at least 1, got {self.moe_locked_max_fetch}")
         if self.moe_backend is None:
@@ -194,6 +201,11 @@ class EngineConfig:
     @property
     def max_forward_len(self) -> int:
         return self.max_seq_len
+
+    @property
+    def decode_rows_per_req(self) -> int:
+        """Query rows each running request takes per decode step; every per-request decode allowance derives from it."""
+        return self.speculative_num_steps + 1 if self.speculative_algorithm is not None else 1
 
     @property
     def distributed_addr(self) -> str:

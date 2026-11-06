@@ -24,6 +24,7 @@ from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import nvtx_annotate
 
 from .attention import Qwen4ExpAttention
+from .config import PLE_NGRAM_STATE
 from .hc import GatedResidual
 from .moe import Qwen4ExpMoE
 from .ple import PLELayer
@@ -54,10 +55,10 @@ def _copy_layer_major_track_state(pool, layer, batch) -> None:
 
 def build_linear_mixer(config: ModelConfig, layer_id: int, prefix: str) -> BaseOP:
     """GDN mixer of a linear_attention layer (Qwen3.5's GDN with a configurable output gate)."""
-    from .gdn import Qwen4ExpGatedDeltaNet
+    from freetoken.layers.linear_attn import GatedDeltaNet
 
     g = config.linear_attention_group()
-    return Qwen4ExpGatedDeltaNet(
+    return GatedDeltaNet(
         hidden_size=config.hidden_size,
         num_k_heads=g.num_key_heads,
         num_v_heads=g.num_value_heads,
@@ -156,10 +157,16 @@ class Qwen4ExpModel(BaseOP):
             else:
                 consumer = nxt.attn_hyper_connection if nxt is not None else self.hyper_connection_mixer
                 hidden, rn = layer.mlp_hyper_connection.combine_norm(hidden, mlp_out, inject, consumer)
-        if meta is not None:
+        if meta is not None and meta.is_verify:
+            # the commit rolls the context by the accepted rows only
+            get_global_ctx().linear_state_pool.verify_handler(PLE_NGRAM_STATE).stash(meta)
+        elif meta is not None:
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
+        if (features := getattr(batch, "features", None)) is not None:
+            # a draft reads the residual streams before the final mix
+            features.final_hidden(hidden)
         return self.hyper_connection_mixer.mix(hidden, rn=rn)[0]
 
     def forward_layer_major(self, chunk_batches: List[Batch]) -> torch.Tensor:
@@ -257,11 +264,14 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 "eos_token_id": args.ngram_boundary_token_id,
                 "image_token_id": args.image_token_id,
             }
+            rows = engine_config.decode_rows_per_req
             disk_table = DiskRowTable(
                 resolve_row_source(engine_config.model_path),
                 constants,
-                max_graph_rows=max(256, engine_config.cuda_graph_max_bs or 0),
-                max_extend_tokens=engine_config.max_extend_tokens,
+                # verify graphs stop at max_running_req requests, decode graphs at cuda_graph_max_bs
+                max_graph_rows=engine_config.max_running_req * rows if rows > 1 else max(256, engine_config.cuda_graph_max_bs or 0),
+                # an eager decode or verify step stages max_running_req * rows tokens, which can exceed a prefill chunk
+                max_eager_tokens=max(engine_config.max_extend_tokens, engine_config.max_running_req * rows),
             )
             self._ple_table = disk_table
             for ple in ple_layers:
@@ -286,7 +296,8 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch
-        return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
+        # the model hands its pre-mix streams to batch.features itself
+        return self.lm_head.forward(self.model.forward(batch.input_ids, batch), export_hidden=False)
 
     def forward_layer_major(self, chunk_batches: List[Batch]) -> torch.Tensor:
         ctx = get_global_ctx()

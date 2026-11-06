@@ -232,11 +232,12 @@ def test_normal_loop_sends_prior_sample_before_abort_terminal():
     scheduler.decode_manager = SimpleNamespace(runnable=False, abort_req=lambda uid: None)
     scheduler._pending_abort_acks = set()
     scheduler._pending_rebuild = None
+    scheduler._pending_flush = None
     scheduler.receive_msg = lambda blocking: [AbortBackendMsg(uid=5)]
     scheduler._schedule_next_batch = lambda: None
     sent = []
     scheduler.send_result = lambda messages: sent.append(messages)
-    late_sample = DetokenizeMsg(uid=5, next_token=99, finished=False)
+    late_sample = DetokenizeMsg(uid=5, next_tokens=[99], finished=False)
     scheduler._process_last_data = lambda _data: scheduler.send_result([late_sample])
 
     Scheduler.normal_loop(scheduler)

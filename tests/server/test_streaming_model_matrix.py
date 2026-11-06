@@ -40,6 +40,7 @@ from freetoken.server.generation import (  # noqa: E402
     ReasoningDelta,
     ToolCallArgsDelta,
     ToolCallsDelta,
+    TokenCountDelta,
     ToolCallStart,
     generate_events,
     generate_full,
@@ -126,6 +127,7 @@ MARKUP_MARKERS = {
 # family, mirroring args.py auto-inference. think_open == "" when the chat template
 # opens the block implicitly (model emits only the closing marker).
 REASONING_FAMILIES = {
+    "flint": ("glm47", "flint", "<think>", "</think>"),
     "dsv4": ("deepseekv32", "deepseekv32", "", "</think>"),
     "dsv4.1": ("deepseekv41", "deepseekv32", "", "</think>"),
     "qwen3.5": ("qwen3_coder", "qwen3", "", "</think>"),
@@ -322,7 +324,7 @@ def test_reasoning_generation_level(name):
 
 
 def test_qwen3_missing_think_closer_recovers_structured_tool_call():
-    # Qwen's template pre-opens <think>.  A model can skip its closing tag and
+    # Qwen's template pre-opens <think>. A model can skip its closing tag and
     # transition directly to a valid XML call; recover the boundary before the
     # tool parser runs, without treating reasoning itself as executable.
     text = THINKING + CALL_BLOCKS["qwen3_coder"]
@@ -543,6 +545,10 @@ def test_content_streams_live_with_tools_configured():
 def test_tool_call_events_shape_and_order():
     block = '<tool_call>\n{"name": "read", "arguments": {"filePath": "/a"}}\n</tool_call>'
     events = _stream_events(["Checking. ", block + "\n", "Done"], "qwen25")
+    # The completion-token frame is a diagnostic side channel: it carries no content and must
+    # not reorder the semantic stream, so the wire-order contract below is checked without it.
+    token_deltas = [ev.count for ev in events if isinstance(ev, TokenCountDelta)]
+    events = [ev for ev in events if not isinstance(ev, TokenCountDelta)]
     kinds = [type(ev).__name__ for ev in events]
     # text, call open + streamed args + close, trailing text, done — in wire order
     assert kinds[0] == "ContentDelta" and kinds[1] == "ToolCallStart"
@@ -554,6 +560,9 @@ def test_tool_call_events_shape_and_order():
     assert json.loads(close.parameters) == {"filePath": "/a"}
     assert events[-2].text.strip() == "Done"
     assert events[-1].finish_reason == "tool_calls"
+    # Kept, not just tolerated: one frame per ack that generated tokens, summing to the
+    # request's completion count, so the diagnostic cannot silently stop being emitted.
+    assert token_deltas and all(c > 0 for c in token_deltas)
 
 
 def test_two_calls_get_output_ordinals():

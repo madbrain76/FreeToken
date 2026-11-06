@@ -155,6 +155,7 @@ class Fixture:
         dtype: torch.dtype = torch.bfloat16,
         page_size: int = 64,
         kv_quant: str = "none",
+        num_speculative_tokens: int = 0,
     ) -> None:
         from freetoken.attention.qsa_sparse import QSASparseAttnBackend
         from freetoken.kvcache import create_kvcache_pool
@@ -172,6 +173,7 @@ class Fixture:
             device=self.device,
             num_req_slots=self.num_req_slots,
             kv_quant=kv_quant,
+            num_speculative_tokens=num_speculative_tokens,
         )
         self.page_table = torch.zeros(
             (self.num_req_slots, num_pages * page_size), dtype=torch.int32, device=self.device
@@ -210,9 +212,9 @@ class Fixture:
             extend_len=device_len - cached_len,
         )
 
-    def step(self, req: SimpleNamespace) -> None:
-        self.allocate(req.table_idx, req.device_len, req.device_len + 1)
-        req.cached_len, req.device_len, req.extend_len = req.device_len, req.device_len + 1, 1
+    def step(self, req: SimpleNamespace, rows: int = 1) -> None:
+        self.allocate(req.table_idx, req.device_len, req.device_len + rows)
+        req.cached_len, req.device_len, req.extend_len = req.device_len, req.device_len + rows, rows
 
     def batch(self, reqs, phase: str) -> SimpleNamespace:
         positions = torch.cat(

@@ -16,7 +16,7 @@ from freetoken.layers import (
     LinearRowParallel,
     OPList,
 )
-from freetoken.utils import div_even
+from freetoken.utils import div_even, init_logger
 
 from freetoken.models.weight_stream import BlockWeightStreamer
 
@@ -24,6 +24,8 @@ if TYPE_CHECKING:
     from freetoken.layers.quantization import QuantConfig
     from freetoken.message import MMItem
     from .config import VisionConfig
+
+logger = init_logger(__name__)
 
 
 class VisionLayerNorm(BaseOP):
@@ -37,14 +39,13 @@ class VisionLayerNorm(BaseOP):
         return F.layer_norm(x, (self._size,), self.weight, self.bias, self._eps)
 
 
-_warned_rope_fallback = False
+
 
 
 def _apply_vision_rope(
     q: torch.Tensor, k: torch.Tensor, cache: torch.Tensor, positions: torch.Tensor, head_dim: int
 ) -> None:
     """In-place 2D rope through the NeoX text kernel: the [c,c]/[s,s] layout is the half-rotation layout and positions index per-token cache rows."""
-    global _warned_rope_fallback
     S = q.shape[0]
     # the triton kernel takes device pointers; the CPU encoder (--mm-encoder-weights cpu) always runs eager
     if q.is_cuda:
@@ -57,11 +58,7 @@ def _apply_vision_rope(
             return
         except ImportError:
             # only a missing triton falls back; a CUDA error must not re-run eager on a half-rotated q/k
-            if not _warned_rope_fallback:
-                _warned_rope_fallback = True
-                from freetoken.utils import init_logger
-
-                init_logger(__name__).warning("vision rope triton kernel unavailable; using eager")
+            logger.warning_once("vision rope triton kernel unavailable; using eager")
     half = cache.shape[1] // 2
     # [x1, x2] -> [x1*c - x2*s, x2*c + x1*s] from views of the table: no per-layer cos/sin or rotated copies
     cos, sin = cache[:, None, :half], cache[:, None, half:]

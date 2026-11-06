@@ -8,6 +8,74 @@ from freetoken.utils import progress
 from freetoken.server.supervisor import BackendHandle, LoadProgress, drain_ready, phase_slug
 
 
+def test_supervisor_reports_the_worker_exit_status():
+    """A deliberate engine give-up must be tellable apart from a crash at the frontend.
+
+    The API server exits without draining connected clients only for the storm code; every other
+    death still gets its graceful shutdown, so the code has to survive the trip through here.
+    """
+    from freetoken.server.supervisor import run_backend_supervisor
+    from freetoken.storm import STORM_EXIT_CODE
+
+    class Proc:
+        name = "freetoken-TP0-scheduler"
+
+        def __init__(self) -> None:
+            self._alive = True
+
+        def is_alive(self) -> bool:
+            return self._alive
+
+        @property
+        def exitcode(self):
+            return None if self._alive else STORM_EXIT_CODE
+
+    proc = Proc()
+    q: "queue.Queue" = queue.Queue()
+    q.put("scheduler ready")
+    handle = BackendHandle(ack_queue=q, processes=[proc], expected_acks=1)
+    seen: dict = {}
+
+    def on_ready() -> None:
+        seen["ready"] = True
+        proc._alive = False
+
+    run_backend_supervisor(
+        handle, LoadProgress(), on_ready=on_ready,
+        on_failure=lambda m, exitcode=None: seen.setdefault("code", exitcode), poll=0.01,
+    )
+    assert seen.get("ready") is True
+    assert seen.get("code") == STORM_EXIT_CODE
+
+
+def test_a_death_without_an_exit_status_keeps_the_single_argument_contract():
+    from freetoken.server.supervisor import run_backend_supervisor
+
+    class Proc:
+        name = "freetoken-TP1-scheduler"
+
+        def __init__(self) -> None:
+            self._alive = True
+
+        def is_alive(self) -> bool:
+            return self._alive
+
+    proc = Proc()
+    q: "queue.Queue" = queue.Queue()
+    q.put("scheduler ready")
+    handle = BackendHandle(ack_queue=q, processes=[proc], expected_acks=1)
+    seen: dict = {}
+
+    def on_ready() -> None:
+        proc._alive = False
+
+    run_backend_supervisor(
+        handle, LoadProgress(), on_ready=on_ready,
+        on_failure=lambda m: seen.setdefault("failure", m), poll=0.01,
+    )
+    assert "TP1" in seen["failure"]
+
+
 def test_drain_ready_counts_ready_acks_and_applies_progress():
     q: "queue.Queue" = queue.Queue()
     q.put(("progress", "Loading weights (FTW)", 5, 10))

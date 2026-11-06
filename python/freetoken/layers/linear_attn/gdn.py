@@ -3,11 +3,11 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
-from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
-from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated
+from freetoken.distributed import get_tp_info
+from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen, causal_conv1d_verify
+from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearOProj
 from freetoken.layers.quantization import QuantConfig
-
-from .gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
+from freetoken.utils import div_even
 
 
 class _DepthwiseConv1d(BaseOP):
@@ -17,7 +17,7 @@ class _DepthwiseConv1d(BaseOP):
         self.weight = torch.empty(conv_dim, 1, kernel)
 
 
-class Qwen3_5GatedDeltaNet(BaseOP):
+class GatedDeltaNet(BaseOP):
     """GatedDeltaNet op using the vendored flash-linear-attention triton kernels
     (``freetoken.kernel.fla``) for the recurrence and a per-request
     recurrent + conv state held in ``ctx.linear_state_pool`` (keyed by ``Req.table_idx``).
@@ -25,19 +25,22 @@ class Qwen3_5GatedDeltaNet(BaseOP):
     Parameter names match HF (``in_proj_qkv``/``in_proj_z``/``in_proj_b``/``in_proj_a``/
     ``conv1d``/``A_log``/``dt_bias``/``norm``/``out_proj``). Handles prefill (incl. chunked
     continuation) and single-token decode; state is fresh when ``req.cached_len == 0``.
+
+    ``output_gate`` is the gate activation name from ``LinearGatedDeltaGroupConfig``
+    ("sigmoid" for Qwen3.8-Flash-Next).
     """
 
     def __init__(
         self, hidden_size, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
-        conv_kernel_size, rms_norm_eps, layer_id, *, quant_config: QuantConfig | None = None,
-        prefix: str = "", out_heads_tiled: bool = False,
+        conv_kernel_size, rms_norm_eps, layer_id, output_gate: str = "silu",
+        *, quant_config: QuantConfig | None = None, prefix: str = "", out_heads_tiled: bool = False,
     ):
         self.layer_id = layer_id
         self._out_heads_tiled = out_heads_tiled
         # The fla chunk/decode kernels read+write the recurrent state and the per-chunk h as
         # [V, K] while the LinearStatePool declares it [K, V]; these coincide (and the
         # hybrid-radix snapshot scatter h[h_row]->slot is a plain copy) only when the two head
-        # dims are equal. Qwen3.5/3.6 satisfy this (128/128); guard any future config.
+        # dims are equal. Qwen3.5/3.6/3.8 satisfy this (128/128); guard any future config.
         assert head_k_dim == head_v_dim, (
             f"GatedDeltaNet requires head_k_dim == head_v_dim, got {head_k_dim} != {head_v_dim}"
         )
@@ -49,36 +52,55 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         self.value_dim = num_v_heads * head_v_dim
         self.conv_dim = 2 * self.key_dim + self.value_dim
         self.conv_kernel_size = conv_kernel_size
+        # TP-local head counts: k heads and their v-head groups split evenly across ranks
+        # (the fla kernels take the GQA ratio from the shapes); the state pool is sharded the
+        # same way (kvcache.linear_state_pool._linear_local_dims).
+        tp = get_tp_info()
+        self._local_num_k_heads = div_even(num_k_heads, tp.size, allow_replicate=True)
+        self._local_num_v_heads = div_even(num_v_heads, tp.size, allow_replicate=True)
+        self._local_key_dim = self._local_num_k_heads * head_k_dim
+        self._local_value_dim = self._local_num_v_heads * head_v_dim
+        self._local_conv_dim = 2 * self._local_key_dim + self._local_value_dim
         # quantized checkpoints quantize qkv|z but not b|a, so the fusion splits into a qkvz GEMM and a ba GEMM with their own schemes (matches sglang / vLLM)
         self._split_in_proj = (
             quant_config is not None and quant_config.scheme_for(f"{prefix}.in_proj_qkvz") is not None
         )
 
-        self._in_proj_split = [self.conv_dim, self.value_dim, num_v_heads, num_v_heads]
+        self._in_proj_split = [
+            self._local_conv_dim, self._local_value_dim,
+            self._local_num_v_heads, self._local_num_v_heads,
+        ]
         if self._split_in_proj:
             self.in_proj_qkvz = LinearColParallelMerged(
                 hidden_size, [self.conv_dim, self.value_dim], has_bias=False,
+                local_output_sizes=[self._local_conv_dim, self._local_value_dim],
                 quant_config=quant_config, prefix=f"{prefix}.in_proj_qkvz",
             )
             self.in_proj_ba = LinearColParallelMerged(
                 hidden_size, [num_v_heads, num_v_heads], has_bias=False,
+                local_output_sizes=[self._local_num_v_heads, self._local_num_v_heads],
                 quant_config=quant_config, prefix=f"{prefix}.in_proj_ba",
             )
         else:
             # Fused input projection (one GEMM instead of four): qkv | z | b | a.
             self.in_proj = LinearColParallelMerged(
-                hidden_size, self._in_proj_split, has_bias=False,
+                hidden_size, [self.conv_dim, self.value_dim, num_v_heads, num_v_heads],
+                has_bias=False, local_output_sizes=self._in_proj_split,
                 quant_config=quant_config, prefix=f"{prefix}.in_proj",
             )
-        self.conv1d = _DepthwiseConv1d(self.conv_dim, conv_kernel_size)
+        self.conv1d = _DepthwiseConv1d(self._local_conv_dim, conv_kernel_size)
         # Recurrence-gating params kept in fp32 (exp/softplus is precision-sensitive,
         # and the fla kernel reads them as fp32) -- matches HF/sglang, and avoids a
-        # per-call .float() upcast in the decode wrapper. The weight loader exempts
+        # per-call .float() upcast before the decode kernel. The weight loader exempts
         # *.A_log / *.dt_bias from the model-dtype downcast.
-        self.dt_bias = torch.empty(num_v_heads, dtype=torch.float32)
-        self.A_log = torch.empty(num_v_heads, dtype=torch.float32)
-        self.norm = GatedRMSNorm(head_v_dim, eps=rms_norm_eps)
-        self.out_proj = LinearReplicated(
+        self.dt_bias = torch.empty(self._local_num_v_heads, dtype=torch.float32)
+        self.A_log = torch.empty(self._local_num_v_heads, dtype=torch.float32)
+        self.norm = GatedRMSNorm(head_v_dim, eps=rms_norm_eps, activation=output_gate)
+        # Row-parallel over the local v heads, all-reduce inside. At TP=1 this is exactly
+        # LinearReplicated (div_even(x, 1) == x and the reduction is skipped), so one class
+        # covers both -- and under TP>1 a replicated o_proj would silently take the wrong
+        # input width and skip the reduction.
+        self.out_proj = LinearOProj(
             self.value_dim, hidden_size, has_bias=False,
             quant_config=quant_config, prefix=f"{prefix}.out_proj",
         )
@@ -108,6 +130,16 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         li = pool.local_index(self.layer_id)
         return causal_conv1d_decode(conv_in, pool.conv_states[li], self._conv_weight(), table_idx)
 
+    def _conv_verify(self, conv_in: torch.Tensor, fla, pool) -> torch.Tensor:
+        """Causal conv over a verify batch's rows: rolls the live conv state as if every row were accepted and parks each row's window in ``fla.verify_scratch``."""
+        li = pool.local_index(self.layer_id)
+        total = conv_in.shape[0]
+        bs = fla.cu_seqlens.numel() - 1
+        # free views both ways: the conv reads any strides and writes token-major output
+        x = conv_in.reshape(bs, total // bs, -1).transpose(1, 2)
+        out = causal_conv1d_verify(x, pool.conv_states[li], self._conv_weight(), fla.cache_indices, fla.verify_scratch.conv_window[li])
+        return out.transpose(1, 2).reshape(total, -1)
+
     def _write_track_snapshot(self, pool, li: int, conv_in: torch.Tensor,
                               h: torch.Tensor, fla) -> None:
         """Snapshot this layer's recurrent + conv state at the chunk-aligned track boundary
@@ -136,62 +168,73 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         if fla is None:
             from freetoken.attention.linear import build_fla_metadata
 
-            fla = build_fla_metadata(batch, hidden_states.device)
+            fla = build_fla_metadata(batch, hidden_states.device, pool)
             batch.fla_metadata = fla
 
         if self._split_in_proj:
             qkvz = self.in_proj_qkvz.forward(hidden_states)
-            conv_in, z = torch.split(qkvz, [self.conv_dim, self.value_dim], dim=-1)
+            conv_in, z = torch.split(qkvz, [self._local_conv_dim, self._local_value_dim], dim=-1)
             ba = self.in_proj_ba.forward(hidden_states)
-            b, a = torch.split(ba, [self.num_v_heads, self.num_v_heads], dim=-1)
+            b, a = torch.split(ba, [self._local_num_v_heads, self._local_num_v_heads], dim=-1)
         else:
             proj = self.in_proj.forward(hidden_states)
             conv_in, z, b, a = torch.split(proj, self._in_proj_split, dim=-1)
-        z = z.reshape(total, self.num_v_heads, self.head_v_dim)
+        nk, nv = self._local_num_k_heads, self._local_num_v_heads
+        kd, vd = self._local_key_dim, self._local_value_dim
+        z = z.reshape(total, nv, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
-        if batch.is_decode:
+        if not batch.is_prefill:
             # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
             # per-request state read/write-by-index, all in one kernel (no gather/scatter,
             # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).
-            mixed = self._conv_decode(conv_in, fla.cache_indices, pool)  # [B, conv_dim]
-            B = mixed.shape[0]
-            qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-            q = qf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
-            k = kf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
-            v = vf.reshape(1, B, self.num_v_heads, self.head_v_dim).to(dtype)
-            core_out = gdn_decode_fla(
-                q, k, v, a, b, A_log=self.A_log, dt_bias=self.dt_bias,
-                state_source=pool.recurrent_states[li], indices=fla.cache_indices,
-                cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
-            )
+            # A verify only reads the live state and stashes each row's inputs; LinearVerifyScratch.commit replays the accepted rows into it.
+            from freetoken.kernel.fla import fused_sigmoid_gating_delta_rule_update
+
+            verify = batch.phase == "verify"
+            if verify:
+                mixed = self._conv_verify(conv_in, fla, pool)
+            else:
+                mixed = self._conv_decode(conv_in, fla.cache_indices, pool)  # [B, conv_dim]
+            qf, kf, vf = torch.split(mixed, [kd, kd, vd], dim=-1)
+            q = qf.reshape(1, total, nk, self.head_k_dim).to(dtype)
+            k = kf.reshape(1, total, nk, self.head_k_dim).to(dtype)
+            v = vf.reshape(1, total, nv, self.head_v_dim).to(dtype)
+            core_out = fused_sigmoid_gating_delta_rule_update(
+                A_log=self.A_log, a=a, dt_bias=self.dt_bias,  # already fp32 (stored fp32)
+                softplus_beta=1.0, softplus_threshold=20.0,
+                q=q, k=k, v=v, b=b,
+                initial_state_source=pool.recurrent_states[li],
+                initial_state_indices=fla.cache_indices,  # already int32 (built int32 by build_fla_metadata)
+                scale=self.head_k_dim ** -0.5, use_qk_l2norm_in_kernel=True, cu_seqlens=fla.cu_seqlens,
+                disable_state_update=verify, input_stash=fla.verify_scratch.input_stash(li) if verify else None,
+            )[0]  # [total, num_v, V]
         else:
+            from freetoken.kernel.fla import chunk_gated_delta_rule
+
             mixed = self._conv_prefill(
                 conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
             # fla chunk handles GQA in-kernel: q/k stay at num_k_heads, v at num_v_heads.
-            qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-            q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
-            k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
-            v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype)
+            qf, kf, vf = torch.split(mixed, [kd, kd, vd], dim=-1)
+            q = qf.reshape(1, total, nk, self.head_k_dim).to(dtype)
+            k = kf.reshape(1, total, nk, self.head_k_dim).to(dtype)
+            v = vf.reshape(1, total, nv, self.head_v_dim).to(dtype)
             g, beta = self._gate_params(a, b)
-            g = g.reshape(1, total, self.num_v_heads)
-            beta = beta.float().reshape(1, total, self.num_v_heads)
+            g = g.reshape(1, total, nv)
+            beta = beta.float().reshape(1, total, nv)
             # The chunk kernel reads + writes back initial_state[cache_indices] in place;
             # fresh sequences (cached_len==0) must start from a zeroed slot.
             if fla.fresh_state_indices is not None:
                 pool.recurrent_states[li].index_fill_(0, fla.fresh_state_indices, 0.0)
-            track = fla.track_dst is not None
-            result = gdn_prefill_chunk_fla(
-                q, k, v, g, beta,
-                state_source=pool.recurrent_states[li], indices=fla.cache_indices,
-                cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
-                return_h=track,
+            o, _, h = chunk_gated_delta_rule(
+                q=q, k=k, v=v, g=g, beta=beta, scale=self.head_k_dim ** -0.5,
+                initial_state=pool.recurrent_states[li], initial_state_indices=fla.cache_indices.to(torch.int32),
+                cu_seqlens=fla.cu_seqlens.to(torch.int64), head_first=False,
+                use_qk_l2norm_in_kernel=True,
             )
-            if track:
-                core_out, h = result
+            core_out = o[0]  # [total, num_v_heads, head_v_dim]
+            if fla.track_dst is not None:
                 self._write_track_snapshot(pool, li, conv_in, h, fla)
-            else:
-                core_out = result
 
         core_out = core_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
@@ -203,4 +246,4 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         return self.out_proj.forward(out)
 
 
-__all__ = ["Qwen3_5GatedDeltaNet"]
+__all__ = ["GatedDeltaNet"]

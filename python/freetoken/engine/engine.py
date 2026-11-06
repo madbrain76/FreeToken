@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
+from freetoken.attention.linear import LinearAttnBackend, gdn_slot
 from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from freetoken.gpu_select import gpu_identity
@@ -19,22 +20,24 @@ from freetoken.env import ENV
 from freetoken.storm import row_fault_counts
 from freetoken.storm import NonFiniteTracer
 from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
-from freetoken.layers import OffloadMoELayer, iter_moe_layers, set_rope_device
+from freetoken.layers import OffloadMoELayer, VocabParallelEmbedding, iter_moe_layers, iter_ops, set_rope_device
 from freetoken.layers.quantization import LayerKind, QuantBackend, QuantKind, finalize_quant, set_quant_backend
 from freetoken.moe.offload_cache import iter_offload_moe_layers
 from freetoken.mm.config import ENCODER_SECTIONS, check_cpu_encoder_support
 from freetoken.models import create_model, load_weight
 from freetoken.models.weight import ftw_lacks_vision
 from freetoken.moe import is_offload_moe_strategy
-from freetoken.moe.expert_banks import attach_resident_banks, load_expert_banks
+from freetoken.moe.expert_banks import attach_resident_banks, load_expert_banks, pin_probe_enabled
 from freetoken.moe.host_banks import PinFailed
+from freetoken.moe.locked_fetch import attach_locked_fetch, check_locked_fetch_config, locked_pool_tags, settle_banks, staging_reserve
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache, bank_layouts
 from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, resolve_profile, split_slots
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
-from .graph import GraphRunner, get_free_memory
+from .graph import GraphRunner, _determine_cuda_graph_bs, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
+from .spec_protocol import SpecRuntime
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
@@ -44,13 +47,25 @@ from freetoken.kvcache.linear_state_pool import (
 
 logger = init_logger(__name__)
 
+def _disable_unsafe_cpu_moe_graphs(config: EngineConfig, executor, dtype, tp_cpu_group) -> None:
+    safe = torch.tensor([executor.graph_capture_safe(dtype)], dtype=torch.int32)
+    if config.tp_info.size > 1:
+        torch.distributed.all_reduce(safe, op=torch.distributed.ReduceOp.MIN, group=tp_cpu_group)
+    if not safe.item():
+        logger.warning_rank0("CPU MoE IO/handshake is not graph-safe on every TP rank for this dtype; disabling decode graphs")
+        # Clear explicit sizes too; GraphRunner gives them priority over max_bs, including on rebuild.
+        object.__setattr__(config, "cuda_graph_bs", [])
+        object.__setattr__(config, "cuda_graph_max_bs", 0)
+
+
 def _clamp_decode_batch_to_pools(config: EngineConfig, pool_sizes: list[int]) -> None:
     """Clamp the decode batch so every GPU-decoded layer's routed experts fit in its pool."""
     num_experts = config.model_config.num_experts
     small = [s for s in pool_sizes if s < num_experts]
     if not small:
         return
-    limit = min(small) // config.model_config.num_experts_per_tok
+    # a decode step routes every row of every request, decode_rows_per_req rows each
+    limit = min(small) // (config.model_config.num_experts_per_tok * config.decode_rows_per_req)
     if config.max_running_req > limit:
         logger.warning_rank0(
             f"the smallest MoE slot pool has {min(small)} slots; lowering max_running_req "
@@ -112,6 +127,12 @@ def _page_table_width(max_seq_len: int, page_size: int) -> int:
     alone does not cover once page_size > 32 (an unaligned --max-seq-len-override on DSV4's P=128
     or trtllm's forced 64 would index past the row)."""
     return align_ceil(align_ceil(max_seq_len, page_size), 32)
+
+
+def _seq_limits(config, num_tokens: int) -> tuple[int, int]:
+    """(longest request, page-table width). A decode step may widen a request by decode_rows_per_req - 1 provisional rows past its length, so requests get that much less and the table still covers the widened tail."""
+    limit = min(config.max_seq_len, num_tokens)
+    return limit - (config.decode_rows_per_req - 1), _page_table_width(limit, config.page_size)
 
 
 def _required_attn_types(model_config) -> frozenset[AttnType]:
@@ -223,6 +244,37 @@ def _resolve_auto_attention_backend(
         )
         + "."
     )
+
+
+def _spec_runner():
+    from freetoken.engine.spec_protocol import SPEC_RUNNER
+    from freetoken.models.register import _load_attr
+
+    return _load_attr(*SPEC_RUNNER.split(":"))
+
+
+def _adjust_spec_config(config, override, windowed_kv: bool) -> None:
+    """Resolve k and the method's own limits, then check what every speculative method needs of the target."""
+    _spec_runner().adjust_config(config, override)
+    if windowed_kv:
+        raise ValueError(
+            "speculative decoding does not support targets with sliding-window or DSV4 window-tier KV yet: "
+            "their window frees would release slots a verify step still reads"
+        )
+    # at config time: the state pool that holds the handlers is built only after the weights load
+    if unverified := [s.name for s in config.model_config.slot_states if s.verify is None]:
+        raise ValueError(f"speculative decoding does not support per-request state {unverified} yet: it declares no verify handler")
+    parts = [p.strip() for p in config.attention_backend.split(",")]
+    graph = attention_backend_info(parts[-1]).uniform_extend_graph
+    if graph == "host_plan" and len(parts) == 2 and attention_backend_info(parts[0]).uniform_extend_graph == "device":
+        # verify steps run on the decode part; a prefill part that captures on device serves them better
+        logger.info_rank0(f"speculative decoding: attention backend {config.attention_backend} -> {parts[0]}")
+        override("attention_backend", parts[0])
+    elif graph == "none":
+        raise ValueError(
+            f"speculative decoding needs a decode attention backend that captures multi-row graphs "
+            f"(fa, triton or fi), got {config.attention_backend!r}"
+        )
 
 
 def _validate_attention_backend_choice(config, override, required: frozenset[AttnType]) -> None:
@@ -341,10 +393,44 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
             )
 
 
+def _host_embedding_keys(model, config: EngineConfig) -> frozenset[str]:
+    """State-dict keys of the tables --embed-weights host keeps in pinned host RAM."""
+    if config.embed_weights != "host":
+        return frozenset()
+    if config.model_config.tie_word_embeddings:
+        raise ValueError(
+            "--embed-weights host: this model's embedding table is tied to its LM head, which reads the whole table "
+            "every step; serve it with --embed-weights gpu"
+        )
+    tables = {id(op.weight) for op in iter_ops(model) if type(op) is VocabParallelEmbedding}
+    keys = frozenset(key for key, t in model.state_dict().items() if id(t) in tables)
+    if not keys:
+        raise ValueError(
+            f"--embed-weights host: {type(model).__name__} has no plain embedding table to move (a DF11 table stays "
+            "on the GPU); serve it with --embed-weights gpu"
+        )
+    return keys
+
+
+def _pinned_copy(key: str, t: torch.Tensor) -> torch.Tensor:
+    from freetoken.kernel.pinned import alloc_pinned_tensor
+
+    try:
+        host = alloc_pinned_tensor(*t.shape, dtype=t.dtype)
+    except RuntimeError as exc:
+        raise PinFailed(
+            f"cudaHostAlloc refused {t.nbytes / 2**20:.0f} MiB for {key} (--embed-weights host); "
+            "free host RAM or serve with --embed-weights gpu"
+        ) from exc
+    host.copy_(t)
+    return host
+
+
 def _make_dummy_weight_state_dict(
     model_state: Dict[str, torch.Tensor],
     *,
     device: torch.device,
+    host_keys: frozenset[str] = frozenset(),
 ) -> Dict[str, torch.Tensor]:
     state_dict: Dict[str, torch.Tensor] = {}
     fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
@@ -367,6 +453,8 @@ def _make_dummy_weight_state_dict(
             state_dict[key] = torch.full(param.shape, 127, dtype=param.dtype, device=device)
         else:
             state_dict[key] = torch.zeros(param.shape, dtype=param.dtype, device=device)
+        if key in host_keys:
+            state_dict[key] = _pinned_copy(key, state_dict[key])
     return state_dict
 
 
@@ -400,6 +488,7 @@ def _materialize_loaded_weight_state_dict(
     weights: Iterable[Tuple[str, torch.Tensor]],
     *,
     device: torch.device,
+    host_keys: frozenset[str] = frozenset(),
 ) -> Dict[str, torch.Tensor]:
     state_dict: Dict[str, torch.Tensor] = {}
     for key, weight in weights:
@@ -409,6 +498,8 @@ def _materialize_loaded_weight_state_dict(
             if key.endswith(".input_scale"):
                 continue
             state_dict[key] = weight.to(device=device)
+        elif key in host_keys:
+            state_dict[key] = _pinned_copy(key, weight.to(dtype=expected.dtype))
         else:
             state_dict[key] = weight.to(device=device, dtype=expected.dtype)
     return state_dict
@@ -475,8 +566,8 @@ class Engine:
             if not config.mm.encoder_out_of_process:
                 # before the residency snapshot, so streamed blocks are not charged as resident weights
                 self.model.place_encoder_weights(config.mm.encoder_weights)
-        # before the residency snapshot, so the freed table goes to the KV pool
-        embed_host_bytes = self._move_embeddings_to_host() if config.embed_device == "cpu" else 0
+        # draft weights load before any pool is sized, so every free-memory read below counts them
+        self.spec: SpecRuntime | None = _spec_runner()(config, self) if config.speculative_algorithm is not None else None
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -488,10 +579,13 @@ class Engine:
         self.moe_offload_cache = None
         self.elastic_kv = None
         self.cpu_moe_executor = None
-        # Host-side auxiliary stores (qwen4_exp's pinned PLE table, the --embed-device cpu table above): after the weights so a
+        # Host-side auxiliary stores (--embed-weights host tables, qwen4_exp's pinned PLE table): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
         # planning sees the pin quota the table already spent.
-        self._host_tables_bytes = embed_host_bytes
+        host_embeds = [op for op in iter_ops(self.model) if type(op) is VocabParallelEmbedding and not op.weight.is_cuda]
+        self._host_tables_bytes = sum(op.weight.nbytes for op in host_embeds)
+        if host_embeds:
+            logger.info_rank0(f"Embedding tables in pinned host RAM (--embed-weights host): {mem_GB(self._host_tables_bytes)}")
         if hasattr(self.model, "load_host_tables"):
             with _weight_load_context():
                 self._host_tables_bytes += int(self.model.load_host_tables(config) or 0)
@@ -536,6 +630,11 @@ class Engine:
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
         available_memory -= state_pool_bytes(config)
+        if self.spec is not None:
+            # the pool solves pages from its own cost; hand it the share its pages get next to the draft's
+            spec_fixed, draft_page = self._spec_budget(config)
+            page_bytes, fixed_bytes = self._pool_cls.kv_cost(config)[:2]
+            available_memory = fixed_bytes + (available_memory - spec_fixed - fixed_bytes) * page_bytes // (page_bytes + draft_page)
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
@@ -570,8 +669,7 @@ class Engine:
 
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
-        self.max_seq_len = min(config.max_seq_len, num_tokens)
-        aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
+        self.max_seq_len, aligned_max_seq_len = _seq_limits(config, num_tokens)
         self.ctx.page_table = self.page_table = torch.zeros(  # + 1 for dummy request
             (config.max_running_req + 1, aligned_max_seq_len),
             dtype=torch.int32,
@@ -586,18 +684,16 @@ class Engine:
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
             config.attention_backend, config.model_config
         )
+        self.linear_backend = LinearAttnBackend(self.device, self.linear_state_pool) if self.linear_state_pool is not None else None
 
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
         # Diagnostic only: unset NAN_TRACE leaves this None and the forward untouched.
         self.nan_tracer = NonFiniteTracer(self.model, self.device) if ENV.NAN_TRACE else None
 
-        post_free_memory = self._sync_get_memory()[0]
-        logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
-
-        # ======================= Graph capture initialization ========================
+        # padded rows replay this request, so it carries one token per decode row
         self.dummy_req = Req(
-            input_ids=torch.tensor([0], dtype=torch.int32, device="cpu"),
+            input_ids=torch.zeros(config.decode_rows_per_req, dtype=torch.int32, device="cpu"),
             table_idx=config.max_running_req,
             cached_len=0,
             output_len=1,
@@ -606,23 +702,22 @@ class Engine:
             cache_handle=None,  # type: ignore
         )
         # padded/dummy rows index the GDN padding slot (0) so gather/scatter hits scratch.
-        if self.linear_state_pool is not None:
+        # Naive GDN keys state by table_idx, where slot 0 is a live request and the dummy's own row is the scratch.
+        if self.linear_state_pool is not None and config.cache_type == "hybrid_radix":
             self.dummy_req.linear_slot_idx = self.linear_state_pool.padding_slot
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
-        self.graph_runner = GraphRunner(
-            stream=self.stream,
-            device=self.device,
-            model=self.model,
-            attn_backend=self.attn_backend,
-            cuda_graph_bs=config.cuda_graph_bs,
-            cuda_graph_max_bs=config.cuda_graph_max_bs,
-            free_memory=init_free_memory,
-            max_seq_len=aligned_max_seq_len,
-            vocab_size=config.model_config.vocab_size,
-            dummy_req=self.dummy_req,
-            moe_offload_cache=self.moe_offload_cache,
-            mrope=config.model_config.model_is_mrope,
-        )
+
+        # ======================= Verify state initialization ========================
+        if config.decode_rows_per_req > 1 and self.linear_state_pool is not None:
+            self.linear_state_pool.attach_verify_scratch(config.max_running_req, config.decode_rows_per_req)
+        if self.spec is not None:
+            self.spec.attach(self)
+
+        post_free_memory = self._sync_get_memory()[0]
+        logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
+
+        # ======================= Graph capture initialization ========================
+        self.graph_runner = self._make_graph_runner(config.cuda_graph_bs, init_free_memory, aligned_max_seq_len)
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
@@ -674,31 +769,17 @@ class Engine:
         resident = [layer for layer in iter_moe_layers(self.model) if not isinstance(layer, OffloadMoELayer)]
         if resident and not config.use_dummy_weight and is_ftw_checkpoint(config.model_path) and not ftw_tensor_names(config.model_path, "experts_bank"):
             raise ValueError(f"{config.model_path} keeps its routed experts as dense weights (an older `ft checkpoint --moe-backend fused`); reconvert it with `ft checkpoint`")
+        host_keys = _host_embedding_keys(self.model, config)
         with _weight_load_context():
-            self.model.load_state_dict(self._load_weight_state_dict(config))
+            self.model.load_state_dict(self._load_weight_state_dict(config, host_keys))
         finalize_quant(self.model)
         if resident:
             self._load_resident_experts(config, resident)
 
-    def _move_embeddings_to_host(self) -> int:
-        from freetoken.layers.embedding import move_input_embeddings_to_host
-
-        moved_bytes, moved = move_input_embeddings_to_host(self.model)
-        if moved:
-            logger.info_rank0(
-                f"--embed-device cpu: {', '.join(moved)} in pinned host RAM ({mem_GB(moved_bytes)})"
-            )
-        else:
-            logger.warning_rank0(
-                "--embed-device cpu: no untied input embedding to move (tied to the LM head or a "
-                "quantized table); it stays on the GPU"
-            )
-        return moved_bytes
-
-    def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
+    def _load_weight_state_dict(self, config: EngineConfig, host_keys: frozenset[str]) -> Dict[str, torch.Tensor]:
         model_state = self.model.state_dict()
         if config.use_dummy_weight:
-            return _make_dummy_weight_state_dict(model_state, device=self.device)
+            return _make_dummy_weight_state_dict(model_state, device=self.device, host_keys=host_keys)
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # MoE models exclude routed experts (they load as expert banks, not dense weights).
@@ -711,6 +792,7 @@ class Engine:
                 include_vision=bool(config.active_encoders) and not config.mm.encoder_out_of_process,
             ),
             device=self.device,
+            host_keys=host_keys,
         )
 
     def _load_resident_experts(self, config: EngineConfig, layers) -> None:
@@ -940,6 +1022,9 @@ class Engine:
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
+        spec_fixed, draft_page = self._spec_budget(config)
+        fixed_cache_size += spec_fixed
+        cache_per_page += draft_page
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
         return resolve_moe_cache_auto(
@@ -977,20 +1062,18 @@ class Engine:
         # --expert-load: serial/parallel force the read; auto (None) lets load_expert_banks
         # pick (parallel for scattered experts, with a low-RAM fallback to serial).
         expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
-        if _locked_fetch_wanted(config) and not 1 <= config.moe_locked_max_fetch <= config.model_config.num_experts:
-            raise ValueError(
-                f"--moe-locked-max-fetch {config.moe_locked_max_fetch} must be in [1, {config.model_config.num_experts}] (the experts of a layer)"
-            )
-        # --moe-cpu-layers auto without a manual pin budget: load unpinned, pin the staging, then pin layers until the driver refuses (host_banks.probe_pin)
-        probe = _pin_probe_enabled(config, layer_methods)
+        check_locked_fetch_config(config)
+        # --moe-cpu-layers auto without a manual pin budget: load unpinned, then pin layers until the driver refuses (settle_banks)
+        # a model the CPU executor cannot serve takes the estimate path, which rejects it before the load when layers must lock
+        probe = pin_probe_enabled(config, mixed_formats=layer_methods is not None) and _cpu_moe_executor_viable(config.model_config)
         if probe:
             from freetoken.moe.host_banks import HostResidency
 
             requested_residency = [HostResidency.DEFERRED.value] * num_moe_layers
             cpu_layer_ids, decode_target, split_residency = frozenset(), None, False
         else:
-            reserved = self._host_tables_bytes + _locked_staging_estimate(config, method, layer_methods)
-            cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=reserved, method=method, all_methods=offload_layer_methods(self.model))
+            reserved = self._host_tables_bytes + staging_reserve(config, lambda: _bank_bytes(config, method, layer_methods))
+            cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=reserved, method=method)
             _check_pin_budget(config, reserved=reserved, method=method, layer_methods=layer_methods)
             decode_target, split_residency = self._residency_split(config, cpu_layer_ids, method, capped=_pin_budget_bytes(reserved) is not None)
             requested_residency = None
@@ -1021,20 +1104,16 @@ class Engine:
                 )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
-        self._locked_staging = None
+        banks, probed, staging = settle_banks(config, banks, probe=probe, has_locked=split_residency)
         if probe:
-            banks, cpu_layer_ids = self._probe_pins(config, banks, num_moe_layers)
+            cpu_layer_ids = probed
             decode_target, split_residency = self._residency_split(config, cpu_layer_ids, method, capped=True)
-        elif split_residency and _locked_fetch_wanted(config):
-            self._locked_staging = self._alloc_locked_staging(config, banks)
         from freetoken.engine.cache_budget import expert_bytes_per_slot, layer_slot_bytes
 
         self._moe_layer_slot_bytes = layer_slot_bytes(banks.sources)
         # hybrid: locked layers keep GPU slots of their own pools and fetch part of their misses through the pinned staging (moe/locked_fetch.py)
-        locked_fetch = split_residency and self._locked_staging is not None
-        layer_tags = banks.layer_tags
-        if locked_fetch:
-            layer_tags = [(t, "locked") if i in cpu_layer_ids else t for i, t in enumerate(layer_tags or [None] * num_moe_layers)]
+        locked_fetch = staging is not None
+        layer_tags = locked_pool_tags(banks.layer_tags, cpu_layer_ids, num_moe_layers) if locked_fetch else banks.layer_tags
         self._moe_pool_groups = group_layers(config.moe_cache_scope, bank_layouts(banks.sources, layer_tags), self._moe_layer_slot_bytes)
         if locked_fetch:
             # a locked refill costs a staged copy: place the locked pools after the pinned ones, which hold the prefill staging when they are big enough
@@ -1052,8 +1131,8 @@ class Engine:
                 f"(--moe-cache-scope per-layer gives each layer its own)"
             )
         self._moe_slot_limit = _slot_limit(layer_methods) if layer_methods is not None else (method.slot_limit() if method is not None else None)
-        # with GPU decode, a pool below num_experts slots bounds the batch; the startup split keeps room for one token per step
-        pools = self._moe_pools(1)
+        # with GPU decode, a pool below num_experts slots bounds the batch; the startup split keeps room for one request's decode step
+        pools = self._moe_pools(config.decode_rows_per_req if decode_target == "gpu" else 1)
         size_cap = sum(p.max_num_slots for p in pools)
         if config.kv_initial_tokens is not None or config.kv_max_tokens is not None:
             self._configure_elastic_kv(config, banks, size_cap)
@@ -1150,58 +1229,10 @@ class Engine:
             self._init_cpu_moe_executor(config, cache, layers)
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
-        if cache.locked_hybrid:
-            from freetoken.moe.locked_fetch import LockedLayerFetch
-
-            locked = sorted(cache.locked_hybrid)
-            cache.locked_fetch = LockedLayerFetch(
-                cache, locked, self._locked_fetch_plan(config, locked), config.moe_locked_max_fetch, cache.cpu_executor, staging=self._locked_staging
-            )
-        self.ctx.moe_offload_cache = cache
+        if locked_fetch:
+            attach_locked_fetch(cache, config, staging, self._profile_layer_rows)
         self.moe_offload_cache = cache
         return cache
-
-    def _probe_pins(self, config: EngineConfig, banks, num_moe_layers: int):
-        """Pin the locked-layer staging first, then the banks middle-out until a pin fails; the rest are OS-locked."""
-        import dataclasses
-        import time
-
-        from freetoken.moe.host_banks import HostResidency, probe_pin
-
-        plan = banks.deferred_plan
-        if plan is None:
-            return banks, frozenset()  # the loader settled the banks itself (pinned)
-        if _locked_fetch_wanted(config):
-            self._locked_staging = self._alloc_locked_staging(config, banks)
-        # a pin quota filled to the brim fails later device allocations under WDDM (WSL and native Windows)
-        wddm = sys.platform == "win32" or (hasattr(os, "uname") and "microsoft" in os.uname().release.lower())
-        margin = int(float(os.environ.get("FREETOKEN_PIN_PROBE_MARGIN_GB", "3" if wddm else "0")) * 2**30)
-        t0 = time.perf_counter()
-        labels = probe_pin(plan, num_moe_layers, margin)
-        locked = frozenset(i for i, r in enumerate(labels) if r != HostResidency.PINNED.value)
-        if not locked and self._locked_staging:
-            from freetoken.moe.host_banks import refund_pin
-
-            refund_pin(sum(t.numel() for t in self._locked_staging.values()))
-            self._locked_staging = None  # every layer pinned: no copier
-        pinned_bytes = sum(b.nbytes for l, bs in plan.deferred.items() if l not in locked for b in bs)
-        logger.info_rank0(
-            f"--moe-cpu-layers auto (pin probe): pinned {num_moe_layers - len(locked)} MoE layers ({pinned_bytes / 2**30:.2f} GiB) "
-            f"in {time.perf_counter() - t0:.1f}s, locked {len(locked)} {sorted(locked)}"
-            + (f", staging {sum(t.numel() for t in self._locked_staging.values()) / 2**20:.1f} MiB pinned first" if self._locked_staging else "")
-        )
-        return dataclasses.replace(banks, layer_residency=labels, deferred_plan=None), locked
-
-    def _alloc_locked_staging(self, config: EngineConfig, banks) -> dict | None:
-        """The locked-layer staging, pinned before the cache is planned; None (locked layers stay CPU-only) when it cannot be pinned."""
-        from freetoken.moe.locked_fetch import alloc_staging, staging_bytes
-
-        sizes = staging_bytes(banks.sources, config.moe_locked_max_fetch)
-        try:
-            return alloc_staging(sizes)
-        except (PinFailed, RuntimeError) as exc:
-            logger.warning_rank0(f"could not pin the {sum(sizes.values()) / 2**20:.1f} MiB locked-layer staging ({exc}); locked layers decode on the CPU only")
-            return None
 
     def _residency_split(self, config: EngineConfig, cpu_layer_ids, method, *, capped: bool):
         """(decode_target, split_residency) for a CPU-layer set; turns prefill overlap off when some layers stay unpinned."""
@@ -1273,7 +1304,8 @@ class Engine:
         keys, labels, rows = layer_rows
         fractions = [fetch_fraction(rows.get(key)) for key in keys]
         cache.hybrid_fetch_fraction = [f or 0.0 for f in fractions]
-        groups = collections.Counter(zip(labels, fractions))
+        # locked layers fetch the fetch_plan share instead; their own log line lists it
+        groups = collections.Counter((labels[l], fractions[l]) for l in range(len(keys)) if l not in cache.locked_hybrid)
         fetched = [f"{f:.1%} on {n} {label} layers" for (label, f), n in groups.items() if f is not None]
         if fetched:
             logger.info_rank0(
@@ -1311,26 +1343,6 @@ class Engine:
             labels.append(f"{_format_label(fmt, tuple(sorted(opts.items())))} {c.hidden}x{c.local_intermediate}")
         return keys, labels, rows
 
-    def _locked_fetch_plan(self, config: EngineConfig, layers: list[int]) -> dict[int, tuple[int, float]]:
-        """(max_fetch, fraction) per locked layer: --moe-locked-fetch, or auto from each layer's `ft bench bw` row (a fixed cap of 1 without one)."""
-        if config.moe_locked_fetch > 0:
-            logger.info_rank0(f"--moe-locked-fetch {config.moe_locked_fetch:g}: locked layers fetch this share of each step's misses")
-            return {layer: (0, config.moe_locked_fetch) for layer in layers}
-        from freetoken.moe.bench_profile import locked_fetch_fraction
-
-        layer_rows = self._profile_layer_rows()
-        keys, labels, rows = layer_rows if layer_rows is not None else ([None] * (max(layers) + 1), [""] * (max(layers) + 1), {})
-        fractions = {layer: locked_fetch_fraction(rows.get(keys[layer])) for layer in layers}
-        groups = collections.Counter((labels[layer], f) for layer, f in fractions.items())
-        if fetched := [f"{f:.1%} on {n} {label} layers" for (label, f), n in groups.items() if f is not None]:
-            logger.info_rank0(f"--moe-locked-fetch auto: locked layers fetch this share of each step's misses (benched p / (2p + c)): {'; '.join(fetched)}")
-        if capped := [layer for layer, f in fractions.items() if f is None]:
-            logger.warning_rank0(
-                f"--moe-locked-fetch auto: no `ft bench bw` row for locked layers {capped}; they fetch at most 1 expert per step. "
-                "`ft bench bw --model <checkpoint>` benches each layer kind"
-            )
-        return {layer: (0, f) if f is not None else (1, 0.0) for layer, f in fractions.items()}
-
     def _init_cpu_moe_executor(self, config: EngineConfig, cache, layers) -> None:
         """Build the persistent CPU MoE executor (decode-time expert compute).
 
@@ -1350,6 +1362,12 @@ class Engine:
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
         # round a batch up to the largest captured size; cover both.
         max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, *(config.cuda_graph_bs or []), 1)
+        max_tokens *= config.decode_rows_per_req
+        # Match GraphRunner's explicit-size precedence, including an empty list.
+        if config.cuda_graph_bs is not None:
+            graph_enabled = bool(config.cuda_graph_bs)
+        else:
+            graph_enabled = config.cuda_graph_max_bs is None or config.cuda_graph_max_bs > 0
         by_id = sorted(layers, key=lambda layer: layer.layer_id)
         layer_formats = [layer.quant_method.cpu_spec() for layer in by_id]
         executor = CpuMoeExecutor(
@@ -1360,12 +1378,16 @@ class Engine:
             num_threads=config.moe_cpu_threads,
             max_tokens=max_tokens,
             device=self.device,
+            activation_dtype=self.dtype,
+            graph_enabled=graph_enabled,
             swiglu_alpha=float(sample.alpha),
             swiglu_limit=sample.limit,
             layer_formats=layer_formats,
         )
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
+        if graph_enabled:
+            _disable_unsafe_cpu_moe_graphs(config, executor, self.dtype, self.tp_cpu_group)
 
     def _sync_get_memory(self) -> Tuple[int, int]:
         """Get the min and max free memory across TP ranks."""
@@ -1414,8 +1436,7 @@ class Engine:
 
     def _refresh_seq_state(self, config) -> None:
         num_tokens = self.num_pages * config.page_size
-        self.max_seq_len = min(config.max_seq_len, num_tokens)
-        aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
+        self.max_seq_len, aligned_max_seq_len = _seq_limits(config, num_tokens)
         if aligned_max_seq_len != self.page_table.shape[1]:
             # max_seq_len changed (e.g. KV grew past the startup token budget); the page table
             # columns must track it or new requests would index out of bounds. The scheduler
@@ -1459,7 +1480,7 @@ class Engine:
                 )
             try:
                 # a rebuild does not lower max_running_req again, so with GPU decode every pool must hold a full batch; hybrid caps its fetches instead
-                batch = config.max_running_req if self.moe_offload_cache.decode_target == "gpu" else 1
+                batch = config.max_running_req * config.decode_rows_per_req if self.moe_offload_cache.decode_target == "gpu" else 1
                 moe_pool_sizes = split_slots(moe_cache_size, self._moe_pools(batch), self._moe_expert_counts)
                 self.moe_offload_cache.validate_rebuild(moe_cache_size, moe_pool_sizes)
             except ValueError as e:
@@ -1508,14 +1529,14 @@ class Engine:
             if num_mamba_slots is not None
             else (self.linear_state_pool.num_slots if self.linear_state_pool is not None else None)
         )
+        spec_fixed, draft_page = self._spec_budget(config)
         self.kv_cache.validate_rebuild(
             config, num_pages=num_pages,
             num_swa_pages=num_swa_pages, target_moe=target_moe,
             per_expert_bytes=per_expert_bytes, baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes, current_num_pages=self.num_pages,
-            extra_fixed_bytes=(
-                state_pool_bytes(config, target_mamba) if target_mamba is not None else 0
-            ),
+            extra_fixed_bytes=(state_pool_bytes(config, target_mamba) if target_mamba is not None else 0) + spec_fixed,
+            extra_page_bytes=draft_page,
             extra_note=(
                 f", mamba={target_mamba - 1} slots" if target_mamba is not None else ""
             ),
@@ -1534,7 +1555,12 @@ class Engine:
         self.rebuild_teardown_started = True
         # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc).
         self.attn_backend.reset_capture()
+        if self.linear_backend is not None:
+            self.linear_backend.reset_capture()
         self.graph_runner.destroy_cuda_graphs()
+        if self.spec is not None:
+            # the draft KV is keyed by the target's slots, so it can stay only when the target KV pool does
+            self.spec.detach(keep_kv=num_pages is None and num_swa_pages is None)
         # 2. Resize caches in place (each frees its old GPU tensors before allocating).
         # Pin the new window first (validated above) so any KV-pool rebuild below sizes the window
         # to it (_dsv4_pool_sizes / _swa_paged_num_tokens read config.swa_num_pages_override).
@@ -1560,32 +1586,68 @@ class Engine:
             self.linear_state_pool.rebuild(num_mamba_slots + 1)
         # 3. Refresh max_seq_len (+ generic page table) for the new token budget.
         self._refresh_seq_state(config)
-        aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
+        aligned_max_seq_len = self.page_table.shape[1]
         # 4. Re-capture CUDA graphs against the new tensors (reset_capture above re-armed
         #    the backend; _sync_get_memory empties the cache so freed memory is reclaimed).
         gc.collect()
         free_min = self._sync_get_memory()[0]
-        self.graph_runner = GraphRunner(
+        if self.spec is not None:
+            self.spec.attach(self)
+        # reuse the startup-resolved bs set (see above)
+        self.graph_runner = self._make_graph_runner(prior_graph_bs, free_min, aligned_max_seq_len)
+
+    def _make_graph_runner(self, cuda_graph_bs, free_memory: int, max_seq_len: int) -> GraphRunner:
+        """The target's graphs: the decode family, or with speculative decoding the verify family in its place."""
+        config = self.config
+        rows = config.decode_rows_per_req
+        verify = {}
+        if rows > 1:
+            # every decode step is a verify; the verify scratch has max_running_req rows
+            cuda_graph_bs = [
+                bs for bs in _determine_cuda_graph_bs(cuda_graph_bs, config.cuda_graph_max_bs, free_memory)
+                if bs <= config.max_running_req
+            ]
+            verify = dict(rows_per_req=rows, phase="verify", batch_hook=self._prepare_verify_batch)
+        runner = GraphRunner(
             stream=self.stream,
             device=self.device,
-            model=self.model,
+            forward=self.model.forward,
             attn_backend=self.attn_backend,
-            cuda_graph_bs=prior_graph_bs,  # reuse the startup-resolved set (see above)
+            cuda_graph_bs=cuda_graph_bs,
             cuda_graph_max_bs=config.cuda_graph_max_bs,
-            free_memory=free_min,
-            max_seq_len=aligned_max_seq_len,
-            vocab_size=config.model_config.vocab_size,
+            free_memory=free_memory,
+            max_seq_len=max_seq_len,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
+            out_dtype=torch.float32,
+            linear_backend=self.linear_backend,
+            **verify,
         )
+        if self.spec is not None:
+            self.spec.capture_graphs(runner.graph_bs_list, runner.graph_pool)
+        return runner
 
-    def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
-        assert torch.cuda.current_stream() == self.stream
-        if batch.mm_gather_plan:
-            self._run_mm_encoder(batch)
-        if self.nan_tracer is not None:
-            self.nan_tracer.begin_step()
+    def _prepare_verify_batch(self, batch: Batch) -> None:
+        batch.features = self.spec.feature_sink(batch)
+
+    def commit_verify(self, reqs, counts, out: torch.Tensor) -> None:
+        """Commit each verified request's first ``counts`` tokens (row i of ``out`` is reqs[i]) to the target's per-request state."""
+        if self.linear_state_pool is not None and self.linear_state_pool.verify_scratch is not None:
+            self.linear_state_pool.commit_verify([gdn_slot(r) for r in reqs], counts)
+        for req, n, tokens in zip(reqs, counts, out):
+            if req.output_token_counts is not None:
+                req.output_token_counts.scatter_add_(0, tokens[:n], req.output_token_counts.new_ones(n))
+
+    def _spec_budget(self, config) -> tuple[int, int]:
+        """(fixed bytes, draft KV bytes per page) speculative decoding adds next to the KV pool."""
+        if getattr(self, "spec", None) is None:
+            return 0, 0
+        fixed, per_token = self.spec.budget(config)
+        return fixed, per_token * config.page_size
+
+    def forward_logits(self, batch: Batch) -> torch.Tensor:
+        """The batch's logits from its captured graph, or eagerly when none fits."""
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
         if getattr(batch, "layer_major", False) and batch.is_prefill:
             with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, False):
@@ -1597,6 +1659,18 @@ class Engine:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
+        return logits
+
+    def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
+        assert torch.cuda.current_stream() == self.stream
+        if batch.mm_gather_plan:
+            self._run_mm_encoder(batch)
+        if self.nan_tracer is not None:
+            self.nan_tracer.begin_step()
+        spec_prefill = self.spec is not None and batch.is_prefill
+        if spec_prefill:
+            batch.features = self.spec.feature_sink(batch)
+        logits = self.forward_logits(batch)
 
         for req in batch.reqs:
             req.complete_one()
@@ -1612,6 +1686,9 @@ class Engine:
         )
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
+        if spec_prefill:
+            # after the D2H is queued: the drain waits for the copy only, while the draft's work overlaps it
+            self.spec.on_prefill(batch, next_tokens_gpu)
         return ForwardOutput(
             next_tokens_gpu,
             next_tokens_cpu,
@@ -1631,7 +1708,7 @@ class Engine:
         origin = req.cached_len
         outer_fla = getattr(batch, "fla_metadata", None)
         if outer_fla is None:
-            outer_fla = build_fla_metadata(batch, self.device)
+            outer_fla = build_fla_metadata(batch, self.device, self.linear_state_pool)
             batch.fla_metadata = outer_fla
         track = None
         if outer_fla.track_dst is not None:
@@ -1685,7 +1762,7 @@ class Engine:
             child.get_attn_positions = lambda child=child: (
                 child.mrope_positions if child.mrope_positions is not None else child.positions
             )
-            child.fla_metadata = build_fla_metadata(child, self.device, include_track=False)
+            child.fla_metadata = build_fla_metadata(child, self.device, self.linear_state_pool, include_track=False)
             child.track_initial_src = child.track_initial_dst = None
             if track is not None:
                 boundary = track["boundary"]
@@ -2154,7 +2231,6 @@ _DENSE_MOE_SETTINGS = {
     "moe_hybrid_max_fetch": -1,
     "moe_locked_fetch": -1.0,
     "moe_locked_max_fetch": 8,
-    "moe_prefill_demand_tokens": 0,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
     "moe_preseed": False,
@@ -2400,6 +2476,8 @@ def _adjust_config(config: EngineConfig):
         )
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
     _validate_attention_backend_choice(config, override, required_attn_types)
+    if getattr(config, "speculative_algorithm", None) is not None:
+        _adjust_spec_config(config, override, is_dsv4 or is_dsv41 or has_swa_attention)
 
     if config.moe_cache_rate is not None:
         total_experts = config.model_config.num_moe_layers * config.model_config.num_experts

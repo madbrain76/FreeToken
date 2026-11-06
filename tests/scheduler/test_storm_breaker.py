@@ -4,6 +4,7 @@ stay quiet on real output, so a NaN never reaches the client as an endless "!"."
 import json
 import pathlib
 import re
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -11,9 +12,11 @@ import torch
 import torch.nn as nn
 
 from freetoken.core import Batch, Req, SamplingParams
+from freetoken.engine.engine import ForwardOutput
 from freetoken.scheduler.scheduler import Scheduler
 from freetoken.storm import (
     NonFiniteTracer,
+    StormUnrecoverable,
     note_repeated_token,
     row_fault,
     row_fault_counts,
@@ -184,6 +187,11 @@ class _StubScheduler:
 
     # The real reporter, not a stand-in: whether a trip can raise is the thing under test.
     _degenerate_generation_reply = Scheduler._degenerate_generation_reply
+    # Likewise the fatal-loop breaker: it runs on every drain, so the drain tests run it too.
+    _storm_check_fatal = Scheduler._storm_check_fatal
+    # Upstream moved append/EOS/stop-string handling into this helper, so the drain reaches it
+    # on every token. Run the real one: a trip must not be able to skip the commit bookkeeping.
+    _commit_tokens = Scheduler._commit_tokens
 
     def __init__(self):
         self.config = SimpleNamespace(step_timeout=120.0, page_size=64)
@@ -226,12 +234,14 @@ class _StubScheduler:
 def _drain(stub, reqs, tokens, counts=None, phase="decode"):
     batch = Batch(reqs=reqs, phase=phase)
     batch.padded_reqs = list(reqs)
-    forward_output = (
-        None,
-        torch.tensor(tokens, dtype=torch.int32),
-        None,
-        None if counts is None else torch.tensor(counts, dtype=torch.int32),
-        None,
+    # The real NamedTuple, not a bare tuple: the drain reads fault_counts_cpu by name.
+    forward_output = ForwardOutput(
+        next_tokens_gpu=None,
+        next_tokens_cpu=torch.tensor(tokens, dtype=torch.int32),
+        copy_done_event=None,
+        fault_counts_cpu=(
+            None if counts is None else torch.tensor(counts, dtype=torch.int32)
+        ),
     )
     Scheduler._process_last_data(stub, (SimpleNamespace(batch=batch), forward_output))
     return batch
@@ -248,7 +258,7 @@ def _errors(stub, code):
 def test_drain_ships_tokens_for_a_healthy_batch():
     stub = _StubScheduler()
     _drain(stub, [_req()], [7], [[0, 0, 0, 64]])
-    assert [(m.uid, m.next_token, m.finished) for m in _replies(stub)] == [(0, 7, False)]
+    assert [(m.uid, m.next_tokens, m.finished) for m in _replies(stub)] == [(0, [7], False)]
     assert stub.freed == [] and stub.decode_manager.removed == []
 
 
@@ -260,8 +270,8 @@ def test_drain_fails_a_nonfinite_row_instead_of_streaming_it():
     errors = _errors(stub, "nonfinite_logits")
     assert [m.uid for m in errors] == [11]
     assert "4 NaN" in errors[0].error and "-Inf" in errors[0].error
-    shipped = [m for m in _replies(stub) if hasattr(m, "next_token")]
-    assert [(m.uid, m.next_token) for m in shipped] == [(10, 7)]
+    shipped = [m for m in _replies(stub) if hasattr(m, "next_tokens")]
+    assert [(m.uid, m.next_tokens) for m in shipped] == [(10, [7])]
     assert stub.freed == [11] and stub.decode_manager.removed == [11]
 
 
@@ -343,3 +353,190 @@ def test_every_logger_helper_the_sources_call_exists():
     assert called, "the scan should find logger calls"
     missing = sorted(name for name in called if not hasattr(logger, name))
     assert not missing, f"logger.{missing} called but never bound"
+
+
+# ---------------------------------------------------------------------------
+# A tripped request must leave no trace the next request can resume from. One
+# non-finite row used to be donated into the prefix cache with its NaN state,
+# so every later hit of that prefix tripped too and only a restart cleared it:
+# 24 trips over 3h19m landed on just 2 of the 24 device state slots.
+
+
+def test_a_faulted_request_is_marked_for_quarantine():
+    stub = _StubScheduler()
+    poisoned = _req()
+    poisoned.uid = 20
+    _drain(stub, [poisoned], [0], [[64, 0, 0, 0]])
+    assert poisoned.generation_poisoned is True
+
+
+def test_a_healthy_request_is_not_quarantined():
+    stub = _StubScheduler()
+    healthy = _req()
+    healthy.uid = 21
+    _drain(stub, [healthy], [7], [[0, 0, 0, 64]])
+    assert healthy.generation_poisoned is False
+
+
+def test_a_trip_record_says_when_it_happened(monkeypatch, tmp_path):
+    """A record with no timestamp can only be placed in time by guessing."""
+    from freetoken.env import ENV
+
+    events = tmp_path / "stamped.jsonl"
+    monkeypatch.setattr(ENV.STORM_EVENT_LOG, "value", str(events))
+    stub = _StubScheduler()
+    poisoned = _req()
+    poisoned.uid = 22
+    _drain(stub, [poisoned], [0], [[64, 0, 0, 0]])
+    record = json.loads(events.read_text().strip())
+    assert isinstance(record["ts"], float) and record["ts"] > 0
+    assert isinstance(record["monotonic"], float)
+
+
+# ---------------------------------------------------------------------------
+# The fatal-loop breaker: repeated, unrecoverable trips take the server down.
+
+
+def _trip(stub, uid):
+    req = _req()
+    req.uid = uid
+    _drain(stub, [req], [0], [[64, 0, 0, 0]])
+    return req
+
+
+def test_one_trip_does_not_take_the_server_down(monkeypatch):
+    from freetoken.env import ENV
+
+    monkeypatch.setattr(ENV.STORM_FATAL_TRIPS, "value", 3)
+    stub = _StubScheduler()
+    _trip(stub, 30)
+    assert [m.uid for m in _errors(stub, "nonfinite_logits")] == [30]
+
+
+def test_trips_that_keep_arriving_exit_the_server(monkeypatch, tmp_path):
+    from freetoken.env import ENV
+
+    events = tmp_path / "fatal.jsonl"
+    monkeypatch.setattr(ENV.STORM_FATAL_TRIPS, "value", 3)
+    monkeypatch.setattr(ENV.STORM_FATAL_WINDOW_S, "value", 300.0)
+    monkeypatch.setattr(ENV.STORM_EVENT_LOG, "value", str(events))
+    stub = _StubScheduler()
+    with pytest.raises(StormUnrecoverable) as exc:
+        for uid in (31, 32, 33):
+            _trip(stub, uid)
+    assert "quarantine did not recover" in str(exc.value)
+    # The API server recognises this code to exit without draining connected clients.
+    assert exc.value.exit_code == StormUnrecoverable.exit_code == 86
+    # The client was answered before the engine went down, and the evidence landed first.
+    assert sorted(m.uid for m in _errors(stub, "nonfinite_logits")) == [31, 32, 33]
+    records = [json.loads(line) for line in events.read_text().splitlines()]
+    fatal = [r for r in records if r["event"] == "storm_fatal_exit"]
+    assert len(fatal) == 1 and sorted(t["uid"] for t in fatal[0]["trips"]) == [31, 32, 33]
+    assert fatal[0]["total_trips"] == 3
+
+
+def test_the_fatal_breaker_is_disabled_at_a_non_positive_limit(monkeypatch):
+    from freetoken.env import ENV
+
+    monkeypatch.setattr(ENV.STORM_FATAL_TRIPS, "value", 0)
+    stub = _StubScheduler()
+    for uid in range(40, 60):
+        _trip(stub, uid)
+
+
+def test_trips_outside_the_window_do_not_count(monkeypatch):
+    from freetoken.env import ENV
+    from freetoken.storm import StormLedger
+
+    monkeypatch.setattr(ENV.STORM_FATAL_TRIPS, "value", 3)
+    monkeypatch.setattr(ENV.STORM_FATAL_WINDOW_S, "value", 60.0)
+    stub = _StubScheduler()
+    stub._storm = StormLedger()
+    stale = time.monotonic() - 10_000.0
+    for uid in (50, 51, 52):
+        stub._storm.note(uid, "nonfinite_logits", now=stale)   # long ago
+    _trip(stub, 53)                                          # only this one is recent
+
+
+# ---------------------------------------------------------------------------
+# A recycled state slot carries its previous owner: the kernels read it as the
+# GDN carry-in, so a slot that held a NaN serves a NaN to whoever gets it next.
+
+
+def _gdn_pool():
+    from freetoken.kvcache.linear_state_pool import LinearStatePool
+    from freetoken.models.config import LinearGatedDeltaGroupConfig
+
+    g = LinearGatedDeltaGroupConfig(
+        name="linear", layer_ids=(0,), num_key_heads=2, num_value_heads=4,
+        key_head_dim=8, value_head_dim=8, conv_kernel_dim=4, output_gate="silu",
+    )
+    return LinearStatePool(group=g, num_slots=8, dtype=torch.bfloat16,
+                           device=torch.device("cpu"), tp_size=1)
+
+
+class _RestoreStub:
+    """The attributes ``_restore_linear_states`` touches."""
+
+    _restore_linear_states = Scheduler._restore_linear_states
+
+    def __init__(self, pool):
+        self.engine = SimpleNamespace(linear_state_pool=pool)
+
+
+def _prefill_batch(reqs):
+    batch = Batch(reqs=reqs, phase="prefill")
+    batch.padded_reqs = list(reqs)
+    return batch
+
+
+def test_a_fresh_slot_is_cleared_before_its_first_forward_reads_it():
+    pool = _gdn_pool()
+    dirty = pool.alloc(1)[0]
+    pool.recurrent_states[:, dirty] = float("nan")
+    pool.conv_states[:, dirty] = float("nan")
+    pool.free([dirty])
+
+    req = _req()
+    req.linear_slot_idx = pool.alloc(1)[0]
+    req.linear_state_fresh = True
+    assert req.linear_slot_idx == dirty, "the pool recycles LIFO"
+    _RestoreStub(pool)._restore_linear_states(_prefill_batch([req]))
+
+    assert not bool(torch.isnan(pool.recurrent_states[:, dirty]).any())
+    assert not bool(torch.isnan(pool.conv_states[:, dirty]).any())
+    assert req.linear_state_fresh is False
+
+
+def test_a_continuation_chunk_keeps_its_live_state():
+    """Wiping a mid-sequence slot would erase the conversation, not the poison."""
+    pool = _gdn_pool()
+    req = _req()
+    req.linear_slot_idx = pool.alloc(1)[0]
+    req.linear_state_fresh = False           # PrefillManager marks continuations this way
+    pool.recurrent_states[:, req.linear_slot_idx] = 2.0
+    _RestoreStub(pool)._restore_linear_states(_prefill_batch([req]))
+    assert float(pool.recurrent_states[:, req.linear_slot_idx].abs().sum()) > 0.0
+
+
+def test_a_restored_snapshot_is_never_cleared_over():
+    pool = _gdn_pool()
+    src, dst = pool.alloc(2)
+    pool.recurrent_states[:, src] = 4.0
+    req = _req()
+    req.linear_slot_idx, req.mamba_restore_src = dst, src
+    req.linear_state_fresh = True
+    _RestoreStub(pool)._restore_linear_states(_prefill_batch([req]))
+    assert float(pool.recurrent_states[:, dst].abs().sum()) > 0.0
+
+
+def test_decode_batches_touch_no_state_slots():
+    pool = _gdn_pool()
+    req = _req()
+    req.linear_slot_idx = pool.alloc(1)[0]
+    req.linear_state_fresh = True
+    pool.recurrent_states[:, req.linear_slot_idx] = float("nan")
+    batch = Batch(reqs=[req], phase="decode")
+    batch.padded_reqs = [req]
+    _RestoreStub(pool)._restore_linear_states(batch)
+    assert bool(torch.isnan(pool.recurrent_states[:, req.linear_slot_idx]).any())

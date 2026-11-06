@@ -89,6 +89,30 @@ def _cuda_hidden():
             os.environ["CUDA_VISIBLE_DEVICES"] = old
 
 
+def _storm_hard_exit(rank: int, exc: BaseException) -> None:
+    """Put this rank down without running any of its teardown.
+
+    ``SystemExit`` is not enough. It hands control to interpreter shutdown, which joins threads
+    and runs atexit -- for a rank that means the CUDA and NCCL destructors while its collectives
+    are still in flight. Observed on 4x RTX 5060 Ti: all four ranks logged the give-up, one took
+    13s to die and the rest never did, so the serve kept holding the port and the frame buffer
+    and the launcher's restart loop waited forever on a child that had already told us it is
+    broken. Discarding the process *is* the remedy, so there is nothing worth cleaning up: flush
+    what the post-mortem needs and let the kernel do the rest.
+    """
+    from freetoken.storm import StormUnrecoverable
+
+    logger = init_logger(__name__)
+    logger.error(f"rank{rank}: storm breaker gave up: {exc}")
+    # The transcript is a pipe to tee, so an unflushed record dies with os._exit().
+    for handler in list(getattr(logger, "handlers", ())):
+        try:
+            handler.flush()
+        except Exception:  # noqa: BLE001 -- a dead log pipe must not keep the rank alive
+            pass
+    os._exit(StormUnrecoverable.exit_code)
+
+
 def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     if args.shell_mode:
         _detach_process_group()
@@ -102,6 +126,7 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
 
     import torch
     from freetoken.scheduler import Scheduler
+    from freetoken.storm import StormUnrecoverable
 
     if args.tp_info.is_primary():
         from freetoken.utils.progress import set_progress_sink
@@ -154,6 +179,11 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
                 print()  # for a clean newline after ^C
                 logger.info("Scheduler exiting gracefully...")
             scheduler.shutdown()
+        except StormUnrecoverable as exc:
+            # Exit with a code the API server recognises, so it takes the serve down at once
+            # instead of parking in uvicorn's connection drain waiting on dead backends. The
+            # exit is unconditional: see _storm_hard_exit for why raising was not enough.
+            _storm_hard_exit(args.tp_info.rank, exc)
 
 
 def launch_server(

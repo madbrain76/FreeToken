@@ -68,6 +68,10 @@ class ServerArgs(SchedulerConfig):
     # input_tokens_details.cached_tokens). Mirrors sglang's --enable-cache-report.
     enable_cache_report: bool = False
     prefill_layer_major: bool = False
+    # Attach llama.cpp's per-request `timings` object to OpenAI chat/completions and
+    # Responses responses (plus queue_ms and, under speculative decoding, draft_n /
+    # draft_n_accepted). Opt-in like vLLM's --enable-per-request-metrics.
+    enable_timings_report: bool = False
     anthropic_inline_system: str = "auto"
     # Comma-separated hostname allowlist for client-supplied image URLs; empty admits any domain.
     allowed_media_domains: str = ""
@@ -235,6 +239,8 @@ def parse_args(
             " ".join(str(v) for v in text_cfg.get("architectures", []) or []),
         ]
         marker = " ".join(candidates).lower()
+        if "flint" in marker:
+            return "glm47"
         if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
             return "gpt_oss"
         # M3 first: its marker also contains the bare "minimax" substring, but the
@@ -286,6 +292,8 @@ def parse_args(
             " ".join(str(v) for v in text_cfg.get("architectures", []) or []),
         ]
         marker = " ".join(candidates).lower()
+        if "flint" in marker:
+            return "flint"
         if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
             return "gpt_oss"
         if "deepseek" in marker and any(
@@ -593,6 +601,15 @@ def parse_args(
         metavar="{vision,audio}",
         help="Encoder towers to leave unbuilt; every input they would serve is rejected.",
     )
+    parser.add_argument(
+        "--mmproj",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="llama.cpp vision tower (mmproj GGUF) for a GGUF model. Default: a *mmproj*.gguf that fits the model "
+        "in the model file's folder (BF16 > F32 > F16 > quantized when several are there); none found, or files of "
+        "several models, serves text only.",
+    )
 
     parser.add_argument(
         "--image-min-tokens",
@@ -687,6 +704,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--enable-timings-report",
+        action="store_true",
+        default=ServerArgs.enable_timings_report,
+        help=(
+            "Attach a llama.cpp-shaped per-request timings object to every chat completion, "
+            "completion and Responses response (and to the final stream chunk), so frontends "
+            "like llama-swap and Open Web UI can show prefill/decode rates and cache hits. "
+            "Spans are measured in the scheduler; queue_ms is a FreeToken extension."
+        ),
+    )
+
+    parser.add_argument(
         "--anthropic-inline-system",
         choices=("auto", "preserve", "fold"),
         default=ServerArgs.anthropic_inline_system,
@@ -744,7 +773,7 @@ def parse_args(
         default="auto",
         choices=[
             "auto", "off", "deepseekv32", "gpt_oss", "qwen3", "glm",
-            "minimax", "minimax_m3", "muse_glimmer", "gemma4",
+            "minimax", "minimax_m3", "muse_glimmer", "gemma4", "flint",
         ],
         help=(
             "Reasoning parser that splits chain-of-thought into reasoning_content "
@@ -796,14 +825,24 @@ def parse_args(
     )
 
     parser.add_argument(
-        "--embed-device",
-        default=ServerArgs.embed_device,
-        choices=["gpu", "cpu"],
+        "--embed-weights",
+        default=ServerArgs.embed_weights,
+        choices=["gpu", "host"],
         help=(
-            "Where the input-embedding table lives. 'cpu' keeps it in pinned host RAM and the "
-            "GPU reads the looked-up rows over PCIe, freeing its VRAM for the KV cache (e.g. "
-            "2.4 GiB on a 248k-vocab, 5120-wide model). Tables tied to the LM head stay on the GPU."
+            "Where the input token embedding table lives. 'gpu' (default) keeps it in VRAM; 'host' keeps it in "
+            "pinned host RAM and each lookup reads its rows over PCIe, so its VRAM goes to the expert cache and KV. "
+            "Not for a table tied to the LM head."
         ),
+    )
+
+    parser.add_argument(
+        "--embed-device",
+        dest="embed_weights",
+        action=_DeprecatedAlias,
+        new_flag="--embed-weights",
+        convert=lambda v: "host" if v == "cpu" else v,
+        choices=["gpu", "cpu"],
+        help=argparse.SUPPRESS,
     )
 
     parser.add_argument(
@@ -944,8 +983,8 @@ def parse_args(
             "is quota-capped, e.g. WSL, their banks are OS-locked instead of pinned). Explicit id list ('3,7,11'), a count ('8' = 8 "
             "layers evenly strided), a fraction ('0.5'), or 'auto'. 'auto' is for hosts that cap CUDA "
             "pinned memory (Windows/WSL): it pins the banks layer by layer from the middle out until CUDA "
-            "refuses one and OS-locks the rest (FREETOKEN_PIN_BUDGET_GB instead fixes the budget and locks "
-            "head+tail layers from an estimate). Under hybrid, locked layers still decode from GPU slots "
+            "refuses one and OS-locks the rest. FREETOKEN_PIN_BUDGET_GB, FTW checkpoints and models the CPU executor "
+            "cannot serve lock head+tail layers from a size estimate instead. Under hybrid, locked layers still decode from GPU slots "
             "(--moe-locked-fetch). Any value, 'auto' included, commits to CPU "
             "decode before the model is built, so the expert format must have a CPU executor "
             "path (bf16, fp8_block, nvfp4, mxfp4); do not pass it on Linux. Unset = every layer on the "
@@ -1048,7 +1087,7 @@ def parse_args(
         help=(
             "During prefill prefetch, copy cache-resident experts device-side into "
             "the double buffer and stream only the misses over PCIe "
-            "(cudaMemcpyBatchAsync, CUDA >= 13.0). Effective with "
+            "(CUDA >= 13.0 or HIP with batch-copy support). Effective with "
             "--moe-cache-size > 2 * num_experts."
         ),
     )
@@ -1062,6 +1101,30 @@ def parse_args(
             "Pre-seed the hit region of the MoE cache at startup to accelerate "
             "prefill (with --moe-prefill-hit-d2d) and warm initial decode steps."
         ),
+    )
+
+    parser.add_argument(
+        "--speculative-algorithm",
+        "--spec-algo",
+        type=str,
+        default=ServerArgs.speculative_algorithm,
+        help="Speculative decoding with this draft method (mtp: the checkpoint's own MTP layers). Off by default.",
+    )
+
+    parser.add_argument(
+        "--speculative-num-steps",
+        "--spec-num-steps",
+        type=int,
+        default=ServerArgs.speculative_num_steps,
+        help="Draft tokens per decode step (k); 0 takes the method's default.",
+    )
+
+    parser.add_argument(
+        "--speculative-draft-model-path",
+        "--spec-draft-model",
+        type=str,
+        default=ServerArgs.speculative_draft_model_path,
+        help="Draft weights; by default they come from the target checkpoint.",
     )
 
     parser.add_argument(
@@ -1117,6 +1180,17 @@ def parse_args(
 
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
+
+    # every process reads the GGUF config, tokenizer workers included, so the choice travels in the environment
+    from freetoken.models.gguf.mmproj import MMPROJ_ENV
+
+    os.environ.pop(MMPROJ_ENV, None)
+    if (mmproj := kwargs.pop("mmproj")) is not None:
+        from freetoken.models.gguf.reader import is_gguf_path
+
+        if not is_gguf_path(kwargs["model_path"]):
+            parser.error("--mmproj needs a .gguf model file")
+        os.environ[MMPROJ_ENV] = os.path.abspath(os.path.expanduser(mmproj))
 
     # a bad media root is a deployment mistake; fail at startup, not per request
     if kwargs["allowed_local_media_path"]:

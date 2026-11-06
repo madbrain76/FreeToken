@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from typing import NamedTuple, Protocol
 
 import torch
@@ -108,6 +109,11 @@ def record_storm_event(path: str, payload: dict) -> bool:
     if not path:
         return False
     try:
+        # Without a wall-clock stamp a record can only be placed in time by correlating it
+        # against the API log, which does not carry the uid either.
+        payload = dict(payload)
+        payload.setdefault("ts", time.time())
+        payload.setdefault("monotonic", time.monotonic())
         expanded = os.path.expanduser(path)
         os.makedirs(os.path.dirname(expanded) or ".", exist_ok=True)
         with open(expanded, "a", encoding="utf-8") as handle:
@@ -115,6 +121,51 @@ def record_storm_event(path: str, payload: dict) -> bool:
         return True
     except Exception:
         return False
+
+
+class StormUnrecoverable(RuntimeError):
+    """The breakers keep failing new requests, so this instance is not going to recover.
+
+    Raised out of the scheduler drain the way the step-timeout handler raises ``TimeoutError``:
+    every TP rank sees the same fault counts and raises at the same drain point, so the ranks go
+    down together and the API supervisor gets a worker death it already knows how to tear down.
+    """
+
+    #: What the rank exits with. The API server recognises it and takes the whole serve down
+    #: without waiting on the clients whose backend is already gone.
+    exit_code = 86
+
+
+STORM_EXIT_CODE = StormUnrecoverable.exit_code
+
+
+class StormLedger:
+    """Recent breaker trips, to tell one unlucky request from a broken engine.
+
+    A single trip is a request the sampler could not serve. Trips that keep arriving on *new*
+    requests after the quarantine has cleared the last one's state mean the poison lives in
+    shared state the request does not own, and no later request can be trusted.
+    """
+
+    def __init__(self, maxlen: int = 512) -> None:
+        self.trips: list[tuple[float, int, str]] = []
+        self.maxlen = maxlen
+        self.total = 0
+
+    def note(self, uid: int, code: str, now: float | None = None) -> None:
+        self.trips.append((time.monotonic() if now is None else now, int(uid), code))
+        if len(self.trips) > self.maxlen:
+            del self.trips[: len(self.trips) - self.maxlen]
+        self.total += 1
+
+    def distinct_uids_within(self, window_s: float, now: float | None = None) -> int:
+        """Requests tripped at least once in the last ``window_s`` seconds."""
+        now = time.monotonic() if now is None else now
+        return len({uid for t, uid, _ in self.trips if now - t <= window_s})
+
+    def recent(self, window_s: float, now: float | None = None) -> list[tuple[float, int, str]]:
+        now = time.monotonic() if now is None else now
+        return [t for t in self.trips if now - t[0] <= window_s]
 
 
 class RepeatState(Protocol):
