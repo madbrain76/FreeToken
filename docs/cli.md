@@ -31,7 +31,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--model-path`, `--model` | required | Local dir, HF repo id, or an FTW dir (auto-detected) |
+| `--model-path`, `--model` | required | Local dir, HF repo id, a `.gguf` file, or an FTW dir (auto-detected) |
 | `--served-model-name` | basename of `--model` | Model id reported by `/v1/models` |
 | `--hf-overrides` | — | JSON object applied to the checkpoint's config as vLLM's `--hf-overrides`: a nested config section updates key by key, any other value is replaced whole. A YaRN `rope_parameters` override serves `original_max_position_embeddings * factor` positions |
 
@@ -71,7 +71,7 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 |---|---|---|
 | `--memory-ratio` | 0.9 | Fraction of free VRAM the engine may use (weights + MoE cache + KV) |
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
-| `--embed-weights` | gpu | Where the input token embedding table lives. `host` keeps it in pinned host RAM and each lookup reads its rows over PCIe, so its VRAM goes to the expert cache and KV. Refused when the table is tied to the LM head |
+| `--embed-weights` | gpu | Where the input token embedding tables live. `host` keeps them in pinned host RAM and each lookup reads its rows over PCIe, so their VRAM goes to the expert cache and KV. A table tied to the LM head stays on the GPU, and `host` is refused when there is no other table; Gemma-4 E2B / E4B's per-layer table is the one that moves, the way those models fit an 8 GB GPU |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--embed-device` | gpu | `cpu` keeps the input-embedding table in pinned host RAM; the GPU reads the looked-up rows over PCIe, and the freed VRAM goes to the KV cache (2.37 GiB on Qwen3.8-27B). Decode reads one row per token, so speed is unchanged. A table tied to the LM head stays on the GPU |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
@@ -132,186 +132,13 @@ See [models.md](models.md#moe-strategies) for what each strategy does, [performa
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--speculative-algorithm`, `--spec-algo` | off | Draft method. `mtp` drafts with the checkpoint's multi-token-prediction layer: Qwen3.5 / Qwen3.6 HF or GGUF checkpoints, and Qwen3.8-Flash-Next HF or GGUF |
-| `--speculative-num-steps`, `--spec-num-steps` | the method's default (3 for `mtp`) | Draft tokens per decode step, 1 to 8 for `mtp` |
-| `--speculative-draft-model-path`, `--spec-draft-model` | the target checkpoint | Where the draft weights load from. A Qwen3.8-Flash-Next target also takes a Strata MTP pack (a GGUF that keeps the checkpoint's `mtp.*` tensors under their HF names), and a Qwen3.8-Flash-Next GGUF target needs one; a Qwen3.5 / Qwen3.6 GGUF target drafts from its own `nextn` MTP block (the block llama.cpp keeps after the last decoder layer), or from an `mtp-*.gguf` sidecar of the same model (unsloth's `MTP/` releases) given here; a separate checkpoint folder is an HF-target option, read with the target's quantization config, and a GGUF target refuses a folder draft |
+| `--speculative-algorithm`, `--spec-algo` | off | Draft method. `mtp` drafts with the checkpoint's multi-token-prediction layer: Qwen3.5 / Qwen3.6 HF or GGUF checkpoints, and Qwen3.8-Flash-Next HF or GGUF. `dflash` drafts a block of tokens per step with a DFlash 2 draft checkpoint over the target's layer outputs, for the Qwen3.5 / Qwen3.6 / Qwen3.8 family and Qwen3.8-Flash-Next: `incoai/Qwen3.8-27B-DFlash2` for Qwen3.8-27B, `incoai/Qwen3.6-35B-A3B-DFlash2` for Qwen3.6-35B-A3B, `incoai/Qwen3.8-Flash-Next-DFlash2` for Qwen3.8-Flash-Next |
+| `--speculative-num-steps`, `--spec-num-steps` | the method's default (3 for `mtp`, the draft's `block_size` - 1 for `dflash`) | Draft tokens per decode step, 1 to 8 for `mtp`; 1 to the draft's `block_size` - 1 for `dflash` |
+| `--speculative-draft-model-path`, `--spec-draft-model` | the target checkpoint | Where the draft weights load from. A Qwen3.8-Flash-Next target also takes a Strata MTP pack (a GGUF that keeps the checkpoint's `mtp.*` tensors under their HF names), and a Qwen3.8-Flash-Next GGUF target needs one; a Qwen3.5 / Qwen3.6 GGUF target drafts from its own `nextn` MTP block (the block llama.cpp keeps after the last decoder layer), or from an `mtp-*.gguf` sidecar of the same model (unsloth's `MTP/` releases) given here; for `mtp`, a separate checkpoint folder is an HF-target option, read with the target's quantization config, and a GGUF target refuses a folder draft. `dflash` requires it: the DFlash 2 draft checkpoint (bf16 safetensors with its `config.json`), whose `target_layer_ids`, `num_target_layers`, hidden size and vocabulary must match the target |
 
-Speculative decoding needs `--tp 1` and runs without overlap scheduling; targets with sliding-window or DSV4 window-tier KV are refused at startup. `mtp` refuses an FTW checkpoint as the draft source, since FTW drops the `mtp.*` tensors, and a Qwen3.5 / Qwen3.6 GGUF converted without its MTP layer (llama.cpp `--no-mtp`) when no `mtp-*.gguf` sidecar is given: such a trunk has no draft of its own to read, while a `--no-mtp` trunk plus a sidecar works (the trunk config's shapes, the sidecar's weights).
 
-### API behaviour
+Speculative decoding supports tensor parallelism (`--tp`) with replicated drafts and cross-rank broadcast consensus, and runs without overlap scheduling; targets with sliding-window or DSV4 window-tier KV are refused at startup. `mtp` refuses an FTW checkpoint as the draft source, since FTW drops the `mtp.*` tensors, and a Qwen3.5 / Qwen3.6 GGUF converted without its MTP layer (llama.cpp `--no-mtp`) when no `mtp-*.gguf` sidecar is given: such a trunk has no draft of its own to read, while a `--no-mtp` trunk plus a sidecar works (the trunk config's shapes, the sidecar's weights).
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `--sampling-defaults` | model | Fill unspecified sampling params from the checkpoint's `generation_config.json` (`none` = framework defaults) |
-| `--tool-call-parser` | auto | Tool-call format; auto-inferred from the model family |
-| `--reasoning-parser` | auto | Splits chain-of-thought into `reasoning_content`; auto-inferred; `off` disables |
-| `--enable-cache-report` | off | Report prefix-cache hits in each response's usage block |
-| `--enable-timings-report` | off | Attach a llama.cpp-shaped per-request `timings` object to responses |
-| `--anthropic-inline-system` | auto | Placement of late Anthropic system instructions: `auto`, `preserve`, or `fold` |
+`dflash` keeps the draft's context in a per-request ring of the draft's sliding window (2048 positions for the released drafts) and, on a hybrid GDN target, in a window on the GDN state slots, so a prefix-cache hit restores it with the GDN snapshot; the window adds `(window + 64) x hidden` activation-dtype bytes to every GDN slot (`/v1/cache/status` counts them). A target without GDN layers needs `--cache-type naive`. Quantized drafts and DFlash v1 drafts are refused. With sampling, the drafts are drawn from the draft's own distribution over its top-16 candidates and verified by rejection sampling against the target's distribution, so the output distribution is the target's.
 
-With `--enable-timings-report` every chat completion, completion and Responses response
-also carries a llama.cpp-shaped `timings` object next to `usage` (`cache_n`, `prompt_n`,
-`prompt_ms`, `prompt_per_token_ms`, `prompt_per_second`, `predicted_n`, `predicted_ms`,
-`predicted_per_token_ms`, `predicted_per_second`, plus `queue_ms` as a FreeToken
-extension and `draft_n` / `draft_n_accepted` under speculative decoding), so frontends
-like llama-swap and Open Web UI show per-request prefill/decode rates. All spans are
-measured in the scheduler: `queue_ms` covers admission to the first prefill chunk,
-`prompt_ms` the first chunk to the first sampled token (chunk gaps included),
-`predicted_ms` the first to the last committed token; `prompt_n` counts only the
-evaluated tokens and the decode rates divide by `predicted_n - 1`, as in llama.cpp. On
-streams the object rides the final chunk; a multi-prompt `/v1/completions` request
-reports the first prompt's spans, as llama.cpp does. `/v1/messages` never carries it
-(llama.cpp emits no timings there either).
-
-### Image input
-
-Experimental. Needs a checkpoint whose family registers a vision encoder ([models.md](models.md#image-input) lists them and how each one
-maps the flags below); a request carrying images is rejected otherwise. Images are accepted on all three protocols (OpenAI `image_url`,
-Anthropic `image` blocks, Responses `input_image`) as an http(s) URL or base64. Images inside a tool
-result (an Anthropic `tool_result` block from Claude Code's Read, a Responses `function_call_output`
-from Codex's view_image) are moved to the user turn that follows the tool message, as vLLM does,
-because chat templates render tool messages as plain text.
-`GET /v1/stats` reports what the server accepts as `model.input_modalities` (`["text"]` or `["text", "image"]`),
-so a client can gate its attachment controls without reading the checkpoint config.
-
-| Flag | Default | Meaning |
-| --- | --- | --- |
-| `--text-model-only` | off | Serve a multimodal checkpoint text-only: no encoder tower is built (its VRAM goes to the KV/expert pools) and every multimodal input is rejected. Same as `--mm-disable` with every encoder kind |
-| `--mm-disable` | none | Encoder towers to leave unbuilt (`vision`, `audio`); every input they would serve is rejected |
-| `--mmproj` | found next to the model | GGUF models only: the llama.cpp vision tower file (`mmproj-*.gguf`), see [Image input](models.md#image-input). Without it, FreeToken takes a `*mmproj*.gguf` that fits the model (output width, tower type, image tokens) from the model file's own folder, BF16 before F32, F16 and quantized files. With none, or with files of several models it cannot tell apart, the model serves text only; a repo that keeps each quant in a subfolder and the mmproj at the top needs `--mmproj`. The log names the file it loads |
-| `--mm-encoder-weights` | host | Where the encoder tower's block weights live. `host` streams them from pinned host banks two blocks at a time behind the compute, so the GPU holds two blocks instead of the whole tower; small images pay the copy time, large ones hide it behind the compute. `gpu` keeps them resident. An encoder without a block stack stays resident either way. `cpu` (Qwen VL families) keeps the whole tower in host RAM and runs it in FP32 in a separate CPU process before a request reaches the GPUs: no VRAM at all, see [CPU vision encoder](#cpu-vision-encoder) |
-| `--mm-encoder-threads` | one NUMA node's cores | `--mm-encoder-weights cpu`: torch threads of the encoder process. Defaults to the CPUs of `--mm-encoder-cpus`, else the physical cores of one NUMA node |
-| `--mm-encoder-cpus` | not pinned | `--mm-encoder-weights cpu`: CPU list the encoder process is pinned to, as `taskset` spells it (`22-43`, `0-3,8`) |
-| `--mm-encoder-cache-mb` | 256 | `--mm-encoder-weights cpu`: host RAM for recently encoded images, keyed by content, so an image a chat client resends on the next turn is not encoded again. `0` disables it |
-| `--image-min-tokens`, `--image-max-tokens` | processor defaults | Per-image token budget: the image processor resizes every image to take between these many tokens, converted to the family's own units by its processor. A family with fixed budgets honors the maximum only and refuses one below its smallest budget at start-up |
-| `--mm-processor-kwargs` | none | JSON object of extra keyword arguments for the checkpoint's image processor call, for knobs the token budget does not cover; applied after the budget, so an explicit key wins |
-| `--mm-embed-cache-device` | cpu | Where encoded image embeddings live between prefill chunks. `cpu` keeps them out of the VRAM budget; `cuda` skips the copy back |
-| `--allowed-media-domains` | any | Comma-separated hostname allowlist for image URLs; requests for other domains are rejected with a 400. Empty allows any domain |
-| `--allowed-local-media-path` | off | Directory `file://` image refs may be read from; unset rejects local files |
-
-#### CPU vision encoder
-
-`--mm-encoder-weights cpu` moves the Qwen VL vision tower out of the engine. A separate process
-(`freetoken-vision-cpu`, started with no CUDA device visible) holds the tower once in host RAM in
-FP32. The tokenizer sends it every request that carries images. It replaces each image's pixels with
-the tower's output rows and passes the request on to the scheduler. The TP ranks build no tower and
-load none of its weights, so serving images costs no VRAM. Running requests keep decoding while an
-image encodes, because the encode happens before the request reaches the GPUs. Text-only requests
-never pass through the encoder.
-
-- FP32, because CPUs without AVX512-BF16 or AMX run BF16 matmuls slower than FP32, and FP32 stays
-  closest to the reference.
-- The process runs at nice 10 and sets its own torch thread count, so an inherited small
-  `OMP_NUM_THREADS` does not throttle it.
-- Images are capped at 1024 tokens (about 1 MP) unless `--image-max-tokens` says otherwise. The
-  Qwen VL checkpoints allow 16k tokens per image, which is minutes of CPU time.
-- Recently encoded images are kept by content (`--mm-encoder-cache-mb`), so a chat client that
-  resends the same picture every turn pays for it once.
-
-Measured on 2x Xeon Gold 6152 (Skylake-SP, AVX-512) with Qwen3.8-Flash-Next, 22 threads, not pinned
-(`benchmarks/bench_cpu_vision.py`):
-
-| Image tokens | Encode time | Peak RSS |
-| --- | --- | --- |
-| 256 | 1.1 s | 2.5 GB |
-| 484 | 2.0 s | 2.7 GB |
-| 1024 | 5.4 s | 2.9 GB |
-| 2025 | 16.6 s | 3.0 GB |
-
-44 threads (both sockets) was no faster than 22, and binding the process to one NUMA node was
-slower than leaving it unpinned. Encoding 1024-token images back to back next to a TP=4 server cost
-its decode about 1-3% and its time to first token about 0.2 s. Against `--text-model-only` on the
-same TP=4 server, VRAM use grew by about 20 MiB per GPU and text decode speed did not change.
-
-## ft shell
-
-```bash
-ft shell                                    # attach to a running server
-ft shell --model ~/models/Qwen3.6-35B-A3B   # serve + chat in one process
-```
-
-- Attach mode talks to `--server URL` (default `http://127.0.0.1:1919`)
-- `--api-key KEY` (default `$FREETOKEN_API_KEY`) attaches to a server started with `--api-key`; with `--model` the shell uses that server's own key
-- `/help` inside the shell lists the commands (`/think`, `/cache`, `/reset`).
-
-## ft ctl
-
-```bash
-ft ctl [--base-url http://127.0.0.1:1919] [--api-key KEY] [--timeout 10] [--json] <subcommand>
-```
-
-`--api-key` defaults to `$FREETOKEN_API_KEY`.
-
-| Subcommand | Endpoint | Purpose |
-|---|---|---|
-| `health` | `GET /health` | Server status, model, load progress |
-| `stats` | `GET /v1/stats` | Throughput, latency, VRAM, pool occupancy, accepted input modalities |
-| `generate [prompt] [--max-tokens N] [--ignore-eos]` | `POST /generate` | Raw completion smoke test (no chat template) |
-| `cache` | `GET /v1/cache/status` | Cache pool table |
-| `cache --moe N \| --kv N \| --mamba N \| --swa N [--wait 300]` | `POST /v1/cache/rebuild` | Live pool resizing without a restart (`k`/`m` suffixes; `--kv`/`--swa` in tokens) |
-| `requests [--since N] [--limit N]` | `GET /v1/requests` | Recent request ring |
-
-## ft launch
-
-```bash
-ft launch {claude,codex,dsh,hermes,openclaw,opencode} [options] [-- <agent args>]
-```
-
-Discovers the served model via `/v1/models`, writes the agent's provider
-config, installs the agent CLI if missing, then launches it. Cloud API keys
-(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …) are cleared from the child
-environment so the agent cannot silently fall back to a paid endpoint.
-When `/v1/stats` reports `image` among `model.input_modalities`, the written
-config declares the model image-capable, which Codex, OpenCode, OpenClaw and
-dsh require before their image tools and attachments send anything; Claude
-Code and Hermes need no declaration.
-
-| Flag | Meaning |
-|---|---|
-| `--server URL` | Server to point the agent at (default `http://127.0.0.1:1919`) |
-| `--api-key KEY` | Key of a server started with `--api-key` (default `$FREETOKEN_API_KEY`). The agent gets it in its environment; Hermes and OpenClaw keep it in their config files |
-| `--dry-run` | Print the planned config changes and command, touch nothing |
-| `-y`, `--yes` | Approve install/config prompts |
-| `--config` | Configure without launching |
-| `--install-only` | Just install the agent CLI (needs no server) |
-| `--force-reinstall` | Re-run the agent installer |
-| `-- <args>` | Forwarded verbatim to the agent |
-
-## ft checkpoint
-
-```bash
-ft checkpoint --model <hf_dir> --out <ftw_dir> [--dtype bfloat16] [--moe-backend offload] [--quant-backend moe.nvfp4=b12x] [--shard-gib 8] [--gpu <uuid-or-index>]
-```
-
-Converts an HF safetensors checkpoint to FTW, FreeToken's self-contained
-fast-load format; point `ft serve --model` at the output dir. MoE experts are
-always packed into expert banks, which serve the fused and the offload
-strategies alike (DeepSeek-V4 experts serve offload only);
-`--moe-backend` is kept for compatibility. See the FTW caveats in
-[models.md](models.md#notes); FTW files from older builds can be repaired with
-[scripts/ftw_hotfix.py](ftw-hotfix.md) instead of reconverting.
-
-## ft bench bw
-
-```bash
-ft bench bw --model /path/to/model.gguf   # every MoE layer kind of a checkpoint (GGUF or HF)
-ft bench bw                               # canonical geometry per expert format
-ft bench bw --gpu 1                       # a specific GPU (UUID or nvidia-smi index, as for ft serve)
-```
-
-Measures host-RAM vs PCIe bandwidth with the real cpu/offload MoE kernels and writes one
-row per MoE layer kind, which `ft serve --moe-strategy hybrid --moe-hybrid-max-fetch -1` reads
-to split each layer's misses.
-
-- One profile per GPU, at `~/.cache/freetoken/benchbw/<gpu-uuid>.json`; a profile from other
-  hardware or another profile version is ignored.
-- A row's key is the layer's CPU format and options, expert shape, top_k and CPU worker
-  threads; a layer without an exact row keeps a fetch cap of 1. Bench with the same
-  `--cpu-threads` as the server's `--moe-cpu-threads`.
-- Each run replaces the rows it benched and keeps the others.
-- What to measure: `--model` (checkpoint paths or presets), `--dtype`, `--formats`, `--isa`.
-- `--threshold` (default 2.0) sets each row's `recommended`: hybrid when CPU bandwidth beats
-  PCIe by that factor.
-
-On NVLink-C2C hosts, see [models.md](models.md#nvlink-c2c-hosts-gh200--gb200)
-for `FREETOKEN_H2D_BLOCKS_PER_BANK` if `PCIe-gather` sits well below the linear H2D ceiling.
+`dflash`

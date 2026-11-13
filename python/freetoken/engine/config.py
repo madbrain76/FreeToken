@@ -14,6 +14,7 @@ from freetoken.utils import cached_load_hf_config, init_logger
 
 if TYPE_CHECKING:
     from freetoken.models import ModelConfig
+    from freetoken.models.config import SlotStateSpec
 
 logger = init_logger(__name__)
 
@@ -131,6 +132,8 @@ class EngineConfig:
     speculative_algorithm: str | None = None
     speculative_num_steps: int = 0
     speculative_draft_model_path: str | None = None
+    # the proposer's states on the target's linear-state slots, resolved by _adjust_config
+    spec_slot_states: tuple[SlotStateSpec, ...] = ()
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
@@ -166,12 +169,17 @@ class EngineConfig:
     @cached_property
     def active_encoders(self) -> tuple[EncoderSpec, ...]:
         """The encoder towers this process builds: the family registers them, the checkpoint config carries their section, --mm-disable did not name them."""
-        return tuple(
-            e
-            for e in self.model_spec.encoders
-            if getattr(self.hf_config, e.config_key, None) is not None
-            and e.kind not in self.mm.disabled_encoders
-        )
+        active = []
+        for e in self.model_spec.encoders:
+            section = getattr(self.hf_config, e.config_key, None)
+            if section is None or e.kind in self.mm.disabled_encoders:
+                continue
+            reason = e.unserved(section) if e.unserved is not None else None
+            if reason is not None:
+                logger.warning(f"{e.kind} input is not served on this checkpoint: {reason}")
+                continue
+            active.append(e)
+        return tuple(active)
 
     @cached_property
     def served_modalities(self) -> frozenset[str]:
@@ -206,6 +214,11 @@ class EngineConfig:
     def decode_rows_per_req(self) -> int:
         """Query rows each running request takes per decode step; every per-request decode allowance derives from it."""
         return self.speculative_num_steps + 1 if self.speculative_algorithm is not None else 1
+
+    @property
+    def slot_states(self) -> tuple[SlotStateSpec, ...]:
+        """Every per-request state the linear-state pool holds: the model's own, then the proposer's."""
+        return self.model_config.slot_states + self.spec_slot_states
 
     @property
     def distributed_addr(self) -> str:

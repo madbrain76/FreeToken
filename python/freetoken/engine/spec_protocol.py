@@ -10,8 +10,17 @@ if TYPE_CHECKING:
     from freetoken.core import Batch, Req
     from freetoken.engine.sample import BatchSamplingArgs
     from freetoken.models.blocks import FeatureSink
+    from freetoken.models.config import SlotStateSpec
 
 SPEC_RUNNER = "freetoken.spec.runner:SpecRunner"
+
+
+class SpecProposal(NamedTuple):
+    """One step's drafts; ``cand``/``q`` carry the draft distribution of each slot when the drafts were sampled, None when they are argmaxes."""
+
+    tokens: torch.Tensor                 # [bs, k] int64 target-vocab ids
+    cand: torch.Tensor | None = None     # [bs, k, K] the support of q
+    q: torch.Tensor | None = None        # [bs, k, K] fp32, each slot's q over cand
 
 
 class SpecForwardOutput(NamedTuple):
@@ -31,6 +40,9 @@ class SpecRuntime(Protocol):
 
     @classmethod
     def budget(cls, config) -> tuple[int, int]: ...
+
+    @classmethod
+    def slot_states(cls, config) -> tuple[SlotStateSpec, ...]: ...
 
     def attach(self, engine) -> None: ...
 

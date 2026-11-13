@@ -134,6 +134,16 @@ GenEvent = ReasoningDelta | ContentDelta | ToolCallStart | ToolCallArgsDelta | T
 
 
 @dataclass
+class GenUsage:
+    """Token counts of a streaming generation so far. generate_events() updates it from each engine reply before it yields that reply's events. `timings` carries that reply's raw scheduler snapshot (the terminal one on requests that did not ask for per-token timings); streamers attach it per chunk only for requests that did."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cached_tokens: int = 0
+    timings: dict[str, Any] | None = None
+
+
+@dataclass
 class GenResult:
     reasoning: str
     content: str
@@ -149,7 +159,8 @@ class GenResult:
 def timings_block(state: Any, timings: dict[str, Any] | None) -> dict[str, Any] | None:
     """llama.cpp's per-request timings object (server_slot_stats::to_json, b10408+) as
     frontends like llama-swap read it, plus queue_ms as a FreeToken extension. The spans
-    and counts are measured in the scheduler (ReqStats) and arrive on the terminal ack:
+    and counts are measured in the scheduler (ReqStats) and arrive on the terminal ack
+    (on every ack of a timings_per_token request):
     queue_ms covers waiting-queue admission to the first prefill chunk, prompt_ms the
     first chunk to the first sampled token on the host, predicted_ms the first to the
     last committed token. prompt_n counts only the evaluated tokens and the decode rates
@@ -224,6 +235,7 @@ def resolve_sampling(
     default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     presence_penalty: float = 0.0,
     frequency_penalty: float = 0.0,
+    timings_per_token: bool = False,
 ) -> SamplingParams:
     """Map a protocol's sampling fields onto the engine's neutral SamplingParams,
     filling unspecified fields from the checkpoint's recommended defaults."""
@@ -247,6 +259,7 @@ def resolve_sampling(
         stop_strs=[s for s in stop_list if s],  # drop empty strings (would match everything)
         presence_penalty=presence_penalty,
         frequency_penalty=frequency_penalty,
+        timings_per_token=timings_per_token,
     )
 
 
@@ -486,8 +499,8 @@ def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
             or bool(ctk.get("enable_thinking"))
             or bool(ctk.get("thinking"))
         )
-    elif parser_name == "flint":
-        # Flint opens its own optional think block, including when tools are present.
+    elif parser_name in ("flint", "ricursive"):
+        # These families open their own optional think block, including when tools are present.
         force_reasoning = False
     elif parser_name == "minimax_m3":
         # M3's template pre-opens <mm:think> only in thinking_mode "enabled" (the
@@ -619,7 +632,7 @@ def _record_generation(
 
 
 async def generate_events(
-    uid: int, spec: GenSpec, state: Any, *, source: str | None = None
+    uid: int, spec: GenSpec, state: Any, *, source: str | None = None, usage: GenUsage | None = None
 ) -> AsyncIterator[GenEvent]:
     """Wraps `_generate_events_impl` to log the request with its totals, read off the terminal
     `GenDone`. The `finally` still records the row on a mid-stream disconnect — but with 0 tokens
@@ -630,7 +643,9 @@ async def generate_events(
     first_token_at: float | None = None
     error: str | None = None
     try:
-        async for ev in _generate_events_impl(uid, spec, state):
+        async for ev in _generate_events_impl(
+            uid, spec, state, usage if usage is not None else GenUsage()
+        ):
             if isinstance(ev, GenDone):
                 prompt_tokens = ev.prompt_tokens
                 completion_tokens = ev.completion_tokens
@@ -671,7 +686,9 @@ async def generate_full(
         )
 
 
-async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIterator[GenEvent]:
+async def _generate_events_impl(
+    uid: int, spec: GenSpec, state: Any, usage: GenUsage
+) -> AsyncIterator[GenEvent]:
     """Protocol-neutral streaming generation. Yields semantic events (reasoning /
     content / tool-call deltas) terminated by exactly one GenDone. Produces no wire
     format — the OpenAI/Anthropic/Responses streamers format these into their own.
@@ -683,9 +700,6 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     carry the output ordinal (0, 1, ...) in tool_index. Formats whose detector
     cannot parse incrementally (supports_streaming=False) keep the previous
     buffer-everything-then-parse-at-the-end behavior."""
-    prompt_tokens = 0
-    completion_tokens = 0
-    cached_tokens = 0
     pending = ""
     parse_tools = spec.parse_tools
     reasoning_parser = _make_reasoning_parser(spec, state)
@@ -779,13 +793,14 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
             raise GenerationError(ack.error, getattr(ack, "error_code", None))
-        prompt_tokens += ack.prompt_tokens_delta
-        completion_tokens += ack.completion_tokens_delta
-        cached_tokens += ack.cached_tokens
+        usage.prompt_tokens += ack.prompt_tokens_delta
+        usage.completion_tokens += ack.completion_tokens_delta
+        usage.cached_tokens += ack.cached_tokens
         if ack.completion_tokens_delta:
             yield TokenCountDelta(ack.completion_tokens_delta)
         if getattr(ack, "timings", None) is not None:
             timings = ack.timings
+            usage.timings = timings
         content_delta = ack.incremental_output
         if reasoning_parser is not None and content_delta:
             reasoning_delta, content_delta = reasoning_parser.parse_stream_chunk(content_delta)
@@ -866,8 +881,8 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
             yield ContentDelta(strip_special_tokens(pending, specials))
 
     yield GenDone(
-        finish_reason, prompt_tokens, completion_tokens,
-        matched_stop=engine_matched_stop, cached_tokens=cached_tokens,
+        finish_reason, usage.prompt_tokens, usage.completion_tokens,
+        matched_stop=engine_matched_stop, cached_tokens=usage.cached_tokens,
         timings=timings,
     )
 

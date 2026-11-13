@@ -20,7 +20,7 @@ from freetoken.env import ENV
 from freetoken.storm import row_fault_counts
 from freetoken.storm import NonFiniteTracer
 from freetoken.checkpoint.ftw import ftw_tensor_names, is_ftw_checkpoint
-from freetoken.layers import OffloadMoELayer, VocabParallelEmbedding, iter_moe_layers, iter_ops, set_rope_device
+from freetoken.layers import OffloadMoELayer, ParallelLMHead, VocabParallelEmbedding, iter_moe_layers, iter_ops, set_rope_device
 from freetoken.layers.quantization import LayerKind, QuantBackend, QuantKind, finalize_quant, set_quant_backend
 from freetoken.moe.offload_cache import iter_offload_moe_layers
 from freetoken.mm.config import ENCODER_SECTIONS, check_cpu_encoder_support
@@ -255,7 +255,9 @@ def _spec_runner():
 
 def _adjust_spec_config(config, override, windowed_kv: bool) -> None:
     """Resolve k and the method's own limits, then check what every speculative method needs of the target."""
-    _spec_runner().adjust_config(config, override)
+    runner = _spec_runner()
+    runner.adjust_config(config, override)
+    override("spec_slot_states", runner.slot_states(config))
     if windowed_kv:
         raise ValueError(
             "speculative decoding does not support targets with sliding-window or DSV4 window-tier KV yet: "
@@ -397,13 +399,15 @@ def _host_embedding_keys(model, config: EngineConfig) -> frozenset[str]:
     """State-dict keys of the tables --embed-weights host keeps in pinned host RAM."""
     if config.embed_weights != "host":
         return frozenset()
-    if config.model_config.tie_word_embeddings:
+    # a tied LM head reads its whole table every step, so that table stays on the GPU
+    tied = {id(op.tied_embedding) for op in iter_ops(model) if isinstance(op, ParallelLMHead) and op.tied_embedding is not None}
+    tables = {id(op.weight) for op in iter_ops(model) if type(op) is VocabParallelEmbedding and id(op) not in tied}
+    keys = frozenset(key for key, t in model.state_dict().items() if id(t) in tables)
+    if not keys and tied:
         raise ValueError(
             "--embed-weights host: this model's embedding table is tied to its LM head, which reads the whole table "
             "every step; serve it with --embed-weights gpu"
         )
-    tables = {id(op.weight) for op in iter_ops(model) if type(op) is VocabParallelEmbedding}
-    keys = frozenset(key for key, t in model.state_dict().items() if id(t) in tables)
     if not keys:
         raise ValueError(
             f"--embed-weights host: {type(model).__name__} has no plain embedding table to move (a DF11 table stays "
@@ -654,7 +658,7 @@ class Engine:
                 dtype=self.dtype,
                 device=self.device,
                 tp_size=config.tp_info.size,
-                slot_states=config.model_config.slot_states,
+                slot_states=config.slot_states,
                 host_slots=host_slots,
             )
             if host_slots > 1:
@@ -876,6 +880,9 @@ class Engine:
 
         cache_per_page, fixed_cache_size, page_tokens, _min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)
+        spec_fixed, draft_page = self._spec_budget(config)
+        fixed_cache_size += spec_fixed
+        cache_per_page += draft_page
         per_expert = expert_bytes_per_slot(banks.sources)
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
@@ -1679,7 +1686,18 @@ class Engine:
         fault_counts = (
             row_fault_counts(batch_logits) if ENV.ABORT_ON_NONFINITE_LOGITS else None
         )
-        next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        if self.config.tp_info.is_primary():
+            next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        else:
+            next_tokens_gpu = torch.empty(batch.size, dtype=torch.int32, device=self.device)
+        if self.config.tp_info.size > 1:
+            from freetoken.distributed import DistributedCommunicator
+            DistributedCommunicator().broadcast(next_tokens_gpu, src=0)
+        if not self.config.tp_info.is_primary() and args.penalties:
+            for row, counts, _, _ in args.penalties:
+                counts.scatter_add_(
+                    0, next_tokens_gpu[row : row + 1].long(), counts.new_ones(1)
+                )
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         fault_counts_cpu = (
             None if fault_counts is None else fault_counts.to("cpu", non_blocking=True)

@@ -210,7 +210,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
         reqs = batch.padded_reqs if hasattr(batch, "padded_reqs") else batch.reqs
         seqlens_q = [r.extend_len for r in reqs]
         seqlens_k = [r.device_len for r in reqs]
-        is_decode = getattr(batch, "phase", None) == "decode"
+        is_decode = getattr(batch, "phase", None) in ("decode", "verify")
         qo_indptr = torch.tensor([0] + seqlens_q, **_CPU_PINNED).cumsum_(0).to(torch.int32)
         kv_len = torch.tensor(seqlens_k, **_CPU_PINNED)
         last = (qo_indptr[1:].to(torch.int32) - 1).to(self.device, non_blocking=True)
@@ -268,8 +268,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
         md.ring_slots = table_idx.to(self.device, non_blocking=True)
         md.block_table = self._block_table(md.ring_slots.to(torch.int64))
         md.seq_lens = md.kv_len_cpu.to(self.device, non_blocking=True)
-        md.token_to_req = torch.arange(bs, dtype=torch.int32, device=self.device)
-        md.cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device=self.device)
+        rows_per_req = getattr(batch, "rows_per_req", 1) or 1
+        md.token_to_req = torch.arange(bs, dtype=torch.int32, device=self.device).repeat_interleave(rows_per_req)
+        md.cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device=self.device) * rows_per_req
 
     # ----- dense layers -------------------------------------------------------------------
     def forward(

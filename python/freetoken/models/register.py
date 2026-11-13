@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import importlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from .config import ModelConfig
@@ -13,6 +13,8 @@ class EncoderSpec:
     kind: str  # "vision" | "audio", the name --mm-disable takes
     config_key: str  # the checkpoint config section that builds the tower
     modalities: tuple[str, ...]  # inputs it serves, as implemented
+    # why a checkpoint's section builds no tower although the family registers one, or None; such a checkpoint serves the other modalities
+    unserved: Callable[[Any], str | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -42,8 +44,9 @@ _QWEN_VL_ROOTS = _LANGUAGE_MODEL_ROOT + (("visual", "model.visual"),)
 _QWEN_VL_PROCESSOR = "freetoken.mm.processors.qwen_vl:QwenVLMMProcessor"
 # TODO: video once the processor samples frames; the tower already takes grid_thw with t > 1
 _QWEN_VL_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
-_QWEN3_5_DRAFTS = (("mtp", "freetoken.models.qwen3_5_moe.mtp:Qwen3_5MTPDraft"),)
-_QWEN4_EXP_DRAFTS = (("mtp", "freetoken.models.qwen4_exp.mtp:Qwen4ExpMTPDraft"),)
+_DFLASH2 = ("dflash", "freetoken.models.dflash:DFlash2DraftModel")
+_QWEN3_5_DRAFTS = (("mtp", "freetoken.models.qwen3_5_moe.mtp:Qwen3_5MTPDraft"), _DFLASH2)
+_QWEN4_EXP_DRAFTS = (("mtp", "freetoken.models.qwen4_exp.mtp:Qwen4ExpMTPDraft"), _DFLASH2)
 # Fused projections split back into their HF leaves so the quantization_config lookup sees the stored names.
 _DENSE_PACKED = (
     ("qkv_proj", ("q_proj", "k_proj", "v_proj")),
@@ -84,7 +87,13 @@ _GEMMA4_SEGMENTS = (
 _GEMMA4_PACKED = _DENSE_PACKED + _EXPERTS_PACKED
 _GEMMA4_PROCESSOR = "freetoken.mm.processors.gemma4:Gemma4MMProcessor"
 _GEMMA4_UNIFIED_PROCESSOR = "freetoken.mm.processors.gemma4:Gemma4UnifiedMMProcessor"
-_GEMMA4_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
+
+
+def _gemma4_vision_unserved(section: Any) -> str | None:
+    return "the tower does not apply clipped linears" if getattr(section, "use_clipped_linears", False) else None
+
+
+_GEMMA4_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",), unserved=_gemma4_vision_unserved),)
 _MUSE_GLIMMER_PROCESSOR = "freetoken.mm.processors.muse_glimmer:MuseGlimmerMMProcessor"
 _MUSE_GLIMMER_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
 _MINIMAX_M3_PACKED = _DENSE_PACKED + (
@@ -93,6 +102,8 @@ _MINIMAX_M3_PACKED = _DENSE_PACKED + (
 _MINIMAX_M3_GGUF_PACKED = _DENSE_PACKED + (("index_qk_proj", ("index_q_proj", "index_k_proj")),) + _EXPERTS_W132_PACKED
 _MINIMAX_M3_PROCESSOR = "freetoken.mm.processors.minimax_m3:MiniMaxM3MMProcessor"
 _MINIMAX_M3_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
+# Ripple's V reads the value residual blend, so it cannot fuse with q and k; the gate stays its own linear as in Muse-Glimmer.
+_RICURSIVE_PACKED = (("qk_proj", ("q_proj", "k_proj")), ("gate_up_proj", ("gate_proj", "up_proj")))
 # DeepSeek-V4's vision dims sit at the top level of the checkpoint config, next to the
 # language model's rather than under a section of their own.
 _DSV4_PROCESSOR = "freetoken.mm.processors.deepseek_v4:DSV4MMProcessor"
@@ -109,6 +120,15 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.flint", "FlintForCausalLM",
         packed_modules_mapping=_DENSE_PACKED + _EXPERTS_PACKED,
         unquantized_modules=("*.mlp.gate",),
+    ),
+    "RicursiveForCausalLM": ModelSpec(
+        "freetoken.models.ricursive", "RicursiveForCausalLM",
+        packed_modules_mapping=_RICURSIVE_PACKED,
+    ),
+    "RicursiveGGUFForCausalLM": ModelSpec(
+        "freetoken.models.ricursive", "RicursiveForCausalLM",
+        parse_config="parse_gguf_config", iter_weights="iter_gguf_weights",
+        packed_modules_mapping=_RICURSIVE_PACKED,
     ),
     "LlamaForCausalLM": ModelSpec(
         "freetoken.models.llama",

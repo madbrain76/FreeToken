@@ -36,6 +36,12 @@ if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
 
+def _pop_chunk(chunks: list, index: int) -> torch.Tensor:
+    chunk = chunks[index]
+    chunks[index] = None
+    return chunk
+
+
 def _copy_layer_major_track_state(pool, layer, batch) -> None:
     """Seed a child at the one outer prefix-checkpoint boundary."""
     src = getattr(batch, "track_initial_src", None)
@@ -98,12 +104,16 @@ class Qwen4ExpDecoderLayer(BaseOP):
         if self.ple is not None:
             hidden = hidden + self.ple.forward(hidden, batch)
         block_input, inject = self.attn_hyper_connection.mix(hidden, rn=rn)
+        del rn
         if self._is_linear:
             block_output = self.linear_attn.forward(block_input)
         else:
             block_output = self.self_attn.forward(block_input, batch)
+        del block_input
         hidden, rn_mlp = self.attn_hyper_connection.combine_norm(hidden, block_output, inject, self.mlp_hyper_connection)
+        del block_output, inject
         block_input, inject = self.mlp_hyper_connection.mix(hidden, rn=rn_mlp)
+        del rn_mlp
         return hidden, self.mlp.forward_parts(block_input), inject
 
 
@@ -143,7 +153,9 @@ class Qwen4ExpModel(BaseOP):
                 ple.start_prefetch(batch, meta)
         # The last block of each layer combines through the layer boundary, fusing the
         # combine with the next consumer's hc_norm -- except before a PLE layer, whose
-        # `hidden + ple(hidden)` happens after the boundary and changes what the norm sees.
+        #  happens after the boundary and changes what the norm sees.
+        features = getattr(batch, "features", None)
+        wanted = features.wanted_layers if features is not None else ()
         layers = self.layers.op_list
         rn = None
         for i, layer in enumerate(layers):
@@ -157,6 +169,8 @@ class Qwen4ExpModel(BaseOP):
             else:
                 consumer = nxt.attn_hyper_connection if nxt is not None else self.hyper_connection_mixer
                 hidden, rn = layer.mlp_hyper_connection.combine_norm(hidden, mlp_out, inject, consumer)
+            if i in wanted:
+                features.layer_output(i, hidden, num_streams=self.hc_count)
         if meta is not None and meta.is_verify:
             # the commit rolls the context by the accepted rows only
             get_global_ctx().linear_state_pool.verify_handler(PLE_NGRAM_STATE).stash(meta)
@@ -164,7 +178,7 @@ class Qwen4ExpModel(BaseOP):
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
-        if (features := getattr(batch, "features", None)) is not None:
+        if features is not None:
             # a draft reads the residual streams before the final mix
             features.final_hidden(hidden)
         return self.hyper_connection_mixer.mix(hidden, rn=rn)[0]
@@ -175,31 +189,36 @@ class Qwen4ExpModel(BaseOP):
 
         ctx = get_global_ctx()
         full_batch = ctx.batch
+        features = getattr(full_batch, "features", None)
+        wanted = features.wanted_layers if features is not None else ()
         hidden = []
         try:
             for child in chunk_batches:
                 ctx._batch = child
                 hidden.append(embed_input_ids(self.embed_tokens, child.input_ids, child).repeat(1, self.hc_count))
 
-            for layer in self.layers.op_list:
+            for i, layer in enumerate(self.layers.op_list):
                 for index, child in enumerate(chunk_batches):
                     ctx._batch = child
                     if layer.ple is not None:
                         child.ple_meta = build_ple_metadata(child, layer.ple.args, child.input_ids.device)
                     _copy_layer_major_track_state(ctx.linear_state_pool, layer, child)
-                    inp = hidden[index]
-                    hidden[index] = None
-                    h, mlp_out, inject = layer.forward(inp, child)
-                    del inp
+                    h, mlp_out, inject = layer.forward(_pop_chunk(hidden, index), child)
                     hidden[index] = layer.mlp_hyper_connection.combine(
                         h, layer.mlp_hyper_connection._epilogue(mlp_out), inject
                     )
                     del h, mlp_out, inject
                     if layer.ple is not None:
                         commit_ngram_context(child.ple_meta, child.fla_metadata)
+                if i in wanted:
+                    features.layer_output(i, hidden, num_streams=self.hc_count)
 
-            res = self.hyper_connection_mixer.mix(hidden[-1])[0]
+            if features is not None:
+                features.final_hidden(hidden)
+            last = hidden.pop()
             hidden.clear()
+            res = self.hyper_connection_mixer.mix(last)[0]
+            del last
             return res
         finally:
             ctx._batch = full_batch
@@ -305,7 +324,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         try:
             hidden = self.model.forward_layer_major(chunk_batches)
             ctx._batch = chunk_batches[-1]
-            out = self.lm_head.forward(hidden)
+            out = self.lm_head.forward(hidden, export_hidden=False)
             del hidden
             return out
         finally:

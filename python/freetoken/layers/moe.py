@@ -250,7 +250,7 @@ class OffloadMoELayer(MoELayer):
             cache is not None
             and getattr(cache, "decode_shared_overlap", None) is not None
             and not get_global_ctx().batch.is_prefill
-            and hidden_states.shape[0] == 1
+            and hidden_states.shape[0] <= get_global_ctx().batch.rows_per_req
             and cache.decode_target == "gpu"
             and not cache.is_cpu_layer(self.layer_id)
             and not cache.is_unpinned_layer(self.layer_id)

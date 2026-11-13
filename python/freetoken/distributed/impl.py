@@ -20,6 +20,9 @@ class DistributedImpl(ABC):
     @abstractmethod
     def all_gather(self, x: torch.Tensor) -> torch.Tensor: ...
 
+    @abstractmethod
+    def broadcast(self, x: torch.Tensor, src: int = 0) -> torch.Tensor: ...
+
 
 @dataclass
 class TorchDistributedImpl(DistributedImpl):
@@ -40,24 +43,71 @@ class TorchDistributedImpl(DistributedImpl):
         dist.all_gather_into_tensor(out, x)
         return out
 
+    def broadcast(self, x: torch.Tensor, src: int = 0) -> torch.Tensor:
+        if not dist.is_initialized() or dist.get_world_size() <= 1:
+            return x
+        backend = dist.get_backend()
+        if x.is_cuda and backend == "gloo":
+            cpu_t = x.cpu()
+            dist.broadcast(cpu_t, src=src)
+            x.copy_(cpu_t)
+        else:
+            dist.broadcast(x, src=src)
+        return x
+
+
 
 @dataclass
 class PyNCCLDistributedImpl(DistributedImpl):
     comm: PyNCCLCommunicator
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
-        self.comm.all_reduce(x, "sum")
+        import tvm_ffi
+
+        with tvm_ffi.use_torch_stream():
+            self.comm.all_reduce(x, "sum")
         return x
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
+        import tvm_ffi
         from .info import get_tp_info
 
         world_size = get_tp_info().size
         output_shape = list(x.shape)
         output_shape[0] *= world_size
         result = x.new_empty(output_shape)
-        self.comm.all_gather(result, x)
+        with tvm_ffi.use_torch_stream():
+            self.comm.all_gather(result, x)
         return result
+
+    def broadcast(self, x: torch.Tensor, src: int = 0) -> torch.Tensor:
+        import tvm_ffi
+        from .info import get_tp_info
+
+        world_size = get_tp_info().size
+        if world_size <= 1:
+            return x
+        if x.is_cuda and x.nbytes > 0 and x.nbytes % 2 == 0:
+            contig = x if x.is_contiguous() else x.contiguous()
+            as_bf16 = contig.view(torch.uint8).view(-1).view(torch.bfloat16)
+            gathered = as_bf16.new_empty((world_size * as_bf16.numel(),))
+            with tvm_ffi.use_torch_stream():
+                self.comm.all_gather(gathered, as_bf16)
+            as_bf16.copy_(gathered.view(world_size, -1)[src])
+            if contig is not x:
+                x.copy_(contig)
+            return x
+        if not dist.is_initialized() or dist.get_world_size() <= 1:
+            return x
+        backend = dist.get_backend()
+        if x.is_cuda and backend == "gloo":
+            cpu_t = x.cpu()
+            dist.broadcast(cpu_t, src=src)
+            x.copy_(cpu_t)
+        else:
+            dist.broadcast(x, src=src)
+        return x
+
 
 
 class DistributedCommunicator:
@@ -68,6 +118,10 @@ class DistributedCommunicator:
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
         return self.plugins[-1].all_gather(x)
+
+    def broadcast(self, x: torch.Tensor, src: int = 0) -> torch.Tensor:
+        return self.plugins[-1].broadcast(x, src=src)
+
 
 
 def enable_pynccl_distributed(
