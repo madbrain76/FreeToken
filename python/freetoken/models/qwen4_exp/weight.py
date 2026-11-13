@@ -512,6 +512,7 @@ _PLE_SCALE2_SUFFIX = ".ple.ple_embedding.ngram_embedding.weight_scale_2"
 _PLE_SHARD_SCALE_RE = re.compile(
     r"\.ple\.ple_embedding\.ngram_embedding\.shard_(?P<shard>\d+)\.weight_scale$"
 )
+_PLE_PACKED_DTYPE = "U8"
 
 
 def _safetensors_header(path: str) -> tuple[dict, int]:
@@ -600,6 +601,21 @@ def dump_ple_table(folder: str, shards: dict[str, torch.Tensor],
                     flush()
     flush()
     return written
+
+
+def ple_table_is_packed(model_path: str) -> bool:
+    """True when the n-gram table shards are NVFP4-packed: reads headers, no payloads.
+
+    The disk backend serves unpacked rows only, so this is the test that decides whether a
+    checkpoint may be streamed from flash instead of pinned whole into host RAM.
+    """
+    folder = download_hf_weight(model_path)
+    for path in _ple_table_files(folder):
+        header, _ = _safetensors_header(path)
+        for key, meta in header.items():
+            if _PLE_SHARD_RE.search(key) is not None:
+                return meta["dtype"] == _PLE_PACKED_DTYPE
+    return False
 
 
 def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
