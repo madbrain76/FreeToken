@@ -36,6 +36,23 @@ def _keep_test_trips_out_of_the_operator_log(tmp_path, monkeypatch):
     monkeypatch.setattr(ENV.STORM_EVENT_LOG, "value", str(tmp_path / "storm-events.jsonl"))
 
 
+@pytest.fixture(autouse=True)
+def _leave_the_fatal_breaker_out_of_the_drain_tests(monkeypatch):
+    """The drain tests assert what one request gets back; the fatal rule ends the process.
+
+    A non-finite row is fatal on its own terms by default -- the policy the 2026-11-10 outage
+    called for, where two trips five seconds apart were followed by nine hours of a live port
+    answering nothing -- so every drain test that fails a poisoned request would raise
+    ``StormUnrecoverable`` out of the very drain it is trying to observe. The fatal tests arm the
+    knobs they are about, and ``test_one_nonfinite_trip_takes_the_server_down_at_the_shipped_
+    default`` proves the defaults these two lines stand down.
+    """
+    from freetoken.env import ENV
+
+    monkeypatch.setattr(ENV.STORM_FATAL_TRIPS, "value", 0)
+    monkeypatch.setattr(ENV.STORM_FATAL_NONFINITE_TRIPS, "value", 0)
+
+
 def _req():
     return Req(
         input_ids=torch.zeros(4, dtype=torch.int32),
@@ -439,6 +456,7 @@ def test_the_fatal_breaker_is_disabled_at_a_non_positive_limit(monkeypatch):
     from freetoken.env import ENV
 
     monkeypatch.setattr(ENV.STORM_FATAL_TRIPS, "value", 0)
+    monkeypatch.setattr(ENV.STORM_FATAL_NONFINITE_TRIPS, "value", 0)
     stub = _StubScheduler()
     for uid in range(40, 60):
         _trip(stub, uid)
@@ -456,6 +474,90 @@ def test_trips_outside_the_window_do_not_count(monkeypatch):
     for uid in (50, 51, 52):
         stub._storm.note(uid, "nonfinite_logits", now=stale)   # long ago
     _trip(stub, 53)                                          # only this one is recent
+
+
+# A non-finite row is weighed on its own rather than pooled with the repeat-run backstop: the
+# value is already bad where the sampler reads it, so a trip there is engine state gone wrong and
+# not one unlucky request. The quarantine can fail a poisoned request; it cannot un-poison the
+# pages, and every later request that reuses them fails at the same offset.
+
+
+def _judge_the_nonfinite_rule_alone(monkeypatch, limit):
+    from freetoken.env import ENV
+
+    monkeypatch.setattr(ENV.STORM_FATAL_TRIPS, "value", 0)
+    monkeypatch.setattr(ENV.STORM_FATAL_NONFINITE_TRIPS, "value", limit)
+
+
+def test_one_nonfinite_trip_takes_the_server_down_at_the_shipped_default(monkeypatch, tmp_path):
+    """The 2026-11-10 outage end to end: two trips, then nine silent hours on a live port."""
+    from freetoken.env import ENV
+
+    events = tmp_path / "nonfinite_fatal.jsonl"
+    # The policy comes from the declaration: the fixtures stand the live value down.
+    assert ENV.STORM_FATAL_NONFINITE_TRIPS.default == 1
+    _judge_the_nonfinite_rule_alone(monkeypatch, ENV.STORM_FATAL_NONFINITE_TRIPS.default)
+    monkeypatch.setattr(ENV.STORM_EVENT_LOG, "value", str(events))
+    stub = _StubScheduler()
+    with pytest.raises(StormUnrecoverable) as exc:
+        _trip(stub, 60)
+    assert "non-finite logits breaker" in str(exc.value)
+    assert "limit 1" in str(exc.value)
+    assert "quarantine did not recover the engine" in str(exc.value)
+    # The client got its terminal reply before the engine went down, and the evidence landed first.
+    assert [m.uid for m in _errors(stub, "nonfinite_logits")] == [60]
+    records = [json.loads(line) for line in events.read_text().splitlines()]
+    fatal = [r for r in records if r["event"] == "storm_fatal_exit"]
+    assert len(fatal) == 1 and fatal[0]["total_trips"] == 1
+    assert [t["code"] for t in fatal[0]["trips"]] == ["nonfinite_logits"]
+
+
+def test_the_nonfinite_rule_waits_for_the_limit_it_was_given(monkeypatch):
+    _judge_the_nonfinite_rule_alone(monkeypatch, 2)
+    stub = _StubScheduler()
+    _trip(stub, 61)                                              # one outlier: keep serving
+    assert [m.uid for m in _errors(stub, "nonfinite_logits")] == [61]
+    with pytest.raises(StormUnrecoverable) as exc:
+        _trip(stub, 62)
+    assert "2 distinct request(s)" in str(exc.value)
+
+
+def test_the_nonfinite_rule_can_be_disabled_without_losing_the_fault(monkeypatch):
+    """STORM_FATAL_NONFINITE_TRIPS=0 is the operator's "keep serving, I am watching" setting."""
+    _judge_the_nonfinite_rule_alone(monkeypatch, 0)
+    stub = _StubScheduler()
+    for uid in range(70, 80):
+        _trip(stub, uid)
+    assert len(_errors(stub, "nonfinite_logits")) == 10
+
+
+def test_the_generic_limit_still_counts_nonfinite_trips(monkeypatch):
+    """With the dedicated rule off, the pooled breaker limit still applies to them."""
+    from freetoken.env import ENV
+
+    monkeypatch.setattr(ENV.STORM_FATAL_NONFINITE_TRIPS, "value", 0)
+    monkeypatch.setattr(ENV.STORM_FATAL_TRIPS, "value", 2)
+    stub = _StubScheduler()
+    with pytest.raises(StormUnrecoverable) as exc:
+        for uid in (80, 81):
+            _trip(stub, uid)
+    assert "tripped a breaker in" in str(exc.value)
+
+
+def test_a_finite_repeat_trip_alone_does_not_arm_the_nonfinite_rule(monkeypatch):
+    """A stuck-but-finite generation is a different fault: one of them must not kill the serve."""
+    from freetoken.env import ENV
+
+    _judge_the_nonfinite_rule_alone(monkeypatch, 1)
+    monkeypatch.setattr(ENV.STORM_TOKEN_RUN, "value", 2)
+    stub = _StubScheduler()
+    req = _req()
+    req.uid = 90
+    clean = [[0, 0, 0, 64]]
+    _drain(stub, [req], [42], clean)
+    _drain(stub, [req], [42], clean)
+    _drain(stub, [req], [42], clean)                             # the run breaks, logits stay finite
+    assert [m.uid for m in _errors(stub, "degenerate_repeat")] == [90]
 
 
 # ---------------------------------------------------------------------------

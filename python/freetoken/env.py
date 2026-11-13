@@ -16,6 +16,10 @@ T = TypeVar("T")
 class EnvVar(BaseEnv, Generic[T]):
     def __init__(self, default_value: T, fn: Callable[[str], T]):
         self.value = default_value
+        # What the build shipped, as opposed to what the environment made it: a guard's default
+        # is a policy, and a test or a provenance line has to be able to read the policy without
+        # re-deriving it from the (possibly patched) current value.
+        self.default = default_value
         self.fn = fn
         super().__init__()
 
@@ -93,6 +97,15 @@ class EnvClassSingleton:
     # request does not own, and no later request can be trusted. 0 keeps serving and only logs.
     STORM_FATAL_TRIPS = EnvInt(8)
     STORM_FATAL_WINDOW_S = EnvFloat(300.0)
+    # Exit the server once this many DISTINCT requests have tripped the *non-finite logits*
+    # breaker inside STORM_FATAL_WINDOW_S, counted separately from STORM_FATAL_TRIPS. A wholly
+    # non-finite logits row is not an unlucky sample: the value is already bad where the sampler
+    # reads it, so the poison sits in state no request owns and every later request that touches
+    # the same pages fails at the same offset. Observed 2026-11-10 -- two trips five seconds
+    # apart and then nine silent hours, because the client had stopped retrying and a rule that
+    # counts trips over a window could never fire. 1 takes the instance down on the first one;
+    # 0 leaves non-finite rows to STORM_FATAL_TRIPS alone.
+    STORM_FATAL_NONFINITE_TRIPS = EnvInt(1)
     # Give the prefix cache a private clone of a donated GDN snapshot instead of the request's
     # own slot. Transfer left one slot id owned by both the tree and a still-in-flight pipeline,
     # so a late write through a retained alias poisoned every later hit of that branch.

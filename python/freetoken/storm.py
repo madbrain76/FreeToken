@@ -22,6 +22,12 @@ import torch
 
 _LAYER_NAME = re.compile(r"(?:^|\.)layers\.\d+$")
 
+#: The breaker codes as they reach the ledger and the event log. The fatal rule weighs them
+#: apart: a non-finite logits row is arithmetic over state that has already gone bad, while a
+#: repeated token stayed finite and can be something the model genuinely wanted to emit.
+NONFINITE_LOGITS = "nonfinite_logits"
+DEGENERATE_REPEAT = "degenerate_repeat"
+
 
 class RowFault(NamedTuple):
     """What was wrong with one logits row, counted before it is failed.
@@ -158,10 +164,22 @@ class StormLedger:
             del self.trips[: len(self.trips) - self.maxlen]
         self.total += 1
 
-    def distinct_uids_within(self, window_s: float, now: float | None = None) -> int:
-        """Requests tripped at least once in the last ``window_s`` seconds."""
+    def distinct_uids_within(
+        self, window_s: float, now: float | None = None, code: str | None = None
+    ) -> int:
+        """Requests tripped at least once in the last ``window_s`` seconds.
+
+        ``code`` narrows the count to one breaker, so the non-finite faults are judged on their
+        own terms instead of being diluted by -- or diluting -- the repeat-run backstop.
+        """
         now = time.monotonic() if now is None else now
-        return len({uid for t, uid, _ in self.trips if now - t <= window_s})
+        return len(
+            {
+                uid
+                for t, uid, trip_code in self.trips
+                if now - t <= window_s and (code is None or trip_code == code)
+            }
+        )
 
     def recent(self, window_s: float, now: float | None = None) -> list[tuple[float, int, str]]:
         now = time.monotonic() if now is None else now

@@ -10,6 +10,8 @@ from freetoken.core import Batch, Req
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
 from freetoken.storm import (
+    DEGENERATE_REPEAT,
+    NONFINITE_LOGITS,
     StormLedger,
     StormUnrecoverable,
     note_repeated_token,
@@ -498,7 +500,7 @@ class Scheduler(SchedulerIOMixin):
                             self._degenerate_generation_reply(
                                 req,
                                 batch,
-                                code="nonfinite_logits",
+                                code=NONFINITE_LOGITS,
                                 detail=f"non-finite logits ({fault.describe()}) at length "
                                 f"{req.input_ids.numel()}",
                             )
@@ -518,7 +520,7 @@ class Scheduler(SchedulerIOMixin):
                             self._degenerate_generation_reply(
                                 req,
                                 batch,
-                                code="degenerate_repeat",
+                                code=DEGENERATE_REPEAT,
                                 detail=f"token {token} repeated {req.repeat_run}x in a row",
                             )
                         )
@@ -586,26 +588,45 @@ class Scheduler(SchedulerIOMixin):
     def _storm_check_fatal(self) -> None:
         """Exit the server while a poisoned engine is still answering, rather than after it stops.
 
-        One trip is one request the sampler could not serve, and the quarantine has already
-        kept its state from spreading. Trips that keep arriving on new requests across a window
-        mean the poison is in state no request owns, so every later request is a coin flip and
-        the instance has to go down: it is the only thing that has ever cleared it, and a fast
-        visible exit beats a server that answers nothing.
+        Two rules, weighed apart, because the two faults are not equally believable as one-offs.
+
+        * A non-finite logits row is arithmetic over state that is already bad where the sampler
+          reads it, so the quarantine has demonstrably not recovered the engine: the next request
+          that touches the same pages dies at the same offset. Observed 2026-11-10 -- two trips
+          five seconds apart, then nine hours of a live port answering nothing, because the client
+          had given up retrying and a rule that counts trips across a window could never fire.
+          One such trip is therefore fatal on its own by default.
+        * A repeated-token collapse stayed finite, and a model can genuinely repeat itself, so it
+          only counts toward the generic limit shared by every breaker.
+
+        Either way the instance has to go down: a new process is the only thing that has ever
+        cleared engine state, and a fast visible exit beats a server that answers nothing.
         """
         limit = int(ENV.STORM_FATAL_TRIPS.value)
-        if limit <= 0:
+        nonfinite_limit = int(ENV.STORM_FATAL_NONFINITE_TRIPS.value)
+        if limit <= 0 and nonfinite_limit <= 0:
             return
         ledger = getattr(self, "_storm", None)
         if ledger is None:
             return
         window = float(ENV.STORM_FATAL_WINDOW_S.value)
-        bad = ledger.distinct_uids_within(window)
-        if bad < limit:
+        reasons: list[str] = []
+        if nonfinite_limit > 0:
+            bad_nonfinite = ledger.distinct_uids_within(window, code=NONFINITE_LOGITS)
+            if bad_nonfinite >= nonfinite_limit:
+                reasons.append(
+                    f"{bad_nonfinite} distinct request(s) tripped the non-finite logits breaker "
+                    f"in {window:.0f}s (limit {nonfinite_limit})"
+                )
+        if limit > 0:
+            bad = ledger.distinct_uids_within(window)
+            if bad >= limit:
+                reasons.append(
+                    f"{bad} distinct requests tripped a breaker in {window:.0f}s (limit {limit})"
+                )
+        if not reasons:
             return
-        detail = (
-            f"{bad} distinct requests tripped a breaker in {window:.0f}s "
-            f"(limit {limit}); quarantine did not recover the engine"
-        )
+        detail = "; ".join(reasons) + "; quarantine did not recover the engine"
         # Evidence first: the ranks are about to die and a pane's scrollback is not evidence.
         record_storm_event(
             ENV.STORM_EVENT_LOG.value,
@@ -621,8 +642,9 @@ class Scheduler(SchedulerIOMixin):
         )
         message = (
             f"{detail}. Exiting so the scheduler state holding the poison is discarded; "
-            "set FREETOKEN_STORM_FATAL_TRIPS=0 to keep serving, FREETOKEN_NAN_TRACE=1 on the "
-            "next launch to name the module that produces the non-finite row."
+            "set FREETOKEN_STORM_FATAL_NONFINITE_TRIPS=0 to keep serving through a non-finite "
+            "row (and FREETOKEN_STORM_FATAL_TRIPS=0 for the other breakers), "
+            "FREETOKEN_NAN_TRACE=1 on the next launch to name the module that produces it."
         )
         try:
             logger.error_rank0(f"STORM FATAL: {message}")
