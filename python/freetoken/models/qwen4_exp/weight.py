@@ -265,6 +265,29 @@ def _shard_rows(
     return torch.cat(out, dim=0)
 
 
+# compressed-tensors exports a projection's FP8 channel scale as <proj>.weight_scale
+# where modelopt exports its block scale as <proj>.weight_scale_inv. For a row-parallel
+# projection the two are the same rank-local object, so the alias is rewritten onto the
+# modelopt spelling and the rules below cover both dialects. Scoped to the row-parallel
+# projections on purpose: .weight_scale also carries the PLE table's fp8 scalar and the
+# NVFP4 global scale, which are not scales of a sharded projection.
+_ROW_PARALLEL_SCALE_ALIASES = (
+    ".self_attn.qkv_proj",
+    ".linear_attn.in_proj",
+    ".linear_attn.in_proj_qkvz",
+    ".linear_attn.in_proj_ba",
+    ".shared_expert.gate_up_proj",
+)
+
+
+def _canonical_scale_name(name: str) -> str:
+    """Map a compressed-tensors row-parallel channel scale onto its modelopt alias."""
+    for prefix in _ROW_PARALLEL_SCALE_ALIASES:
+        if name.endswith(f"{prefix}.weight_scale"):
+            return name[: -len(".weight_scale")] + ".weight_scale_inv"
+    return name
+
+
 def _shard(name: str, t: torch.Tensor, config, rank: int, world: int) -> torch.Tensor:
     """Slice projection weights for tensor parallelism.
 
@@ -274,9 +297,22 @@ def _shard(name: str, t: torch.Tensor, config, rank: int, world: int) -> torch.T
     """
     if world == 1:
         return t
+    canonical = _canonical_scale_name(name)
+    if canonical != name:
+        # Only a per-row 1-D scale survives row slicing. A 2-D scale matrix would be cut
+        # through its multi-row blocks, so refuse it the way weight_scale_inv already does.
+        if t.ndim != 1:
+            raise NotImplementedError(
+                f"qwen4_exp tensor parallelism shards 1-D compressed-tensors weight_scale "
+                f"only; {name} is {t.ndim}-D, which would split a block scale across ranks"
+            )
+        name = canonical
     # 128x128 2D block-fp8 has float32 2D scale matrices where row slicing would cut across multi-row scale blocks.
     # MXFP8 has uint8 1D per-row scales [N, K//32], so each row is completely independent.
-    if name.endswith(".weight_scale_inv") and t.dtype != torch.uint8:
+    # Dimensionality is the discriminator: a block scale is 2D by construction ([N, K/block]),
+    # while a naive-quantized channel scale is 1D per row whatever its dtype, so a float 1D
+    # scale is sharded like the uint8 one rather than refused with it.
+    if name.endswith(".weight_scale_inv") and t.ndim == 2 and t.dtype != torch.uint8:
         raise NotImplementedError("qwen4_exp tensor parallelism serves bf16 or MXFP8 dense weights, not 128x128 block-fp8 ones")
     if name.endswith(".in_proj.weight") and t.dtype in _QUANT_DTYPES:
         raise NotImplementedError("qwen4_exp tensor parallelism serves bf16 or split MXFP8 in_proj, not unsplit block-fp8 in_proj")
