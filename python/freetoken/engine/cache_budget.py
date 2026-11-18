@@ -244,6 +244,8 @@ class ElasticKv:
     moe_floor: int
     initial_tokens: int
     max_tokens: int
+    # Startup MoE slot count to restore when shrinking back to ``initial_tokens`` (0 -> replan).
+    initial_moe_slots: int = 0
     # Kept so a restart still accepts state built with the old field. The grow no longer
     # bills ``tokens * width``; see ``prefill_scratch_bytes``.
     activation_width: int = 0
@@ -264,3 +266,13 @@ class ElasticKv:
             moe_floor=self.moe_floor,
             activation_bytes=hold,
         )
+
+    def shrink_target(self, current_tokens: int) -> tuple[int, int] | None:
+        """Return ``(moe_slots, num_pages)`` to restore initial geometry if expanded, else None."""
+        if current_tokens <= self.initial_tokens:
+            return None
+        if self.initial_moe_slots > 0:
+            pages = div_ceil(self.initial_tokens, self.page_size)
+            return self.initial_moe_slots, pages
+        moe, pages, _overlap = self.plan(self.initial_tokens)
+        return moe, pages

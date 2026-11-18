@@ -128,3 +128,89 @@ def test_grow_covers_several_requests_until_the_ceiling():
     # A request above the ceiling is ignored; the one that fits still grows the pool.
     assert elastic_grow_tokens(32_000, [300_000, 40_000], 100_000) == 40_000
     assert elastic_grow_tokens(32_000, [], 100_000) is None
+
+
+def test_elastic_kv_shrink_target_restores_initial_geometry():
+    ek = ElasticKv(
+        budget_bytes=2000 * 1024,
+        per_expert_bytes=1024,
+        cache_per_page=1024,
+        page_size=64,
+        num_experts=4,
+        total_experts=5_000,
+        max_slots=5_000,
+        prefill_overlap=True,
+        moe_floor=8,
+        initial_tokens=32_768,
+        max_tokens=262_144,
+        initial_moe_slots=15_360,
+    )
+    assert ek.shrink_target(32_768) is None
+    assert ek.shrink_target(16_384) is None
+    assert ek.shrink_target(201_152) == (15_360, 512)
+
+    ek_auto = ElasticKv(
+        budget_bytes=2000 * 1024,
+        per_expert_bytes=1024,
+        cache_per_page=1024,
+        page_size=64,
+        num_experts=4,
+        total_experts=5_000,
+        max_slots=5_000,
+        prefill_overlap=True,
+        moe_floor=8,
+        initial_tokens=32_768,
+        max_tokens=262_144,
+    )
+    moe, pages = ek_auto.shrink_target(65_536)
+    expected_moe, expected_pages, _ = ek_auto.plan(32_768)
+    assert (moe, pages) == (expected_moe, expected_pages)
+
+
+def test_scheduler_idle_shrink_timeout_and_trigger(monkeypatch):
+    from types import SimpleNamespace
+    from freetoken.env import ENV
+    from freetoken.scheduler.scheduler import Scheduler
+
+    ek = ElasticKv(
+        budget_bytes=2000 * 1024,
+        per_expert_bytes=1024,
+        cache_per_page=1024,
+        page_size=64,
+        num_experts=4,
+        total_experts=5_000,
+        max_slots=5_000,
+        prefill_overlap=True,
+        moe_floor=8,
+        initial_tokens=32_768,
+        max_tokens=262_144,
+        initial_moe_slots=15_360,
+    )
+    rebuilt = []
+    replied = []
+    sched = object.__new__(Scheduler)
+    sched.config = SimpleNamespace(offline_mode=False)
+    sched.engine = SimpleNamespace(elastic_kv=ek, num_pages=512)
+    sched._kv_wait = []
+    sched.prefill_manager = SimpleNamespace(runnable=False)
+    sched.decode_manager = SimpleNamespace(runnable=False)
+    sched.rebuild_cache = lambda **kw: rebuilt.append(kw)
+    sched._log_cache_geometry = lambda _event: None
+    sched._reply_rebuild = lambda rid, status: replied.append((rid, status))
+
+    monkeypatch.setattr(ENV.ELASTIC_KV_SHRINK_IDLE_SEC, "value", 60.0)
+    # At initial size: no timeout, no shrink
+    assert sched.idle_timeout_ms() is None
+    sched._maybe_shrink_kv()
+    assert rebuilt == []
+
+    # Expanded to 201K: timeout active and _maybe_shrink_kv restores initial geometry
+    sched.engine.num_pages = 3143
+    assert sched.idle_timeout_ms() == 60_000
+    sched._maybe_shrink_kv()
+    assert rebuilt == [{"moe_cache_size": 15_360, "num_pages": 512}]
+    assert replied == [("elastic_kv", "ok")]
+
+    # Disabled via env=0
+    monkeypatch.setattr(ENV.ELASTIC_KV_SHRINK_IDLE_SEC, "value", 0.0)
+    assert sched.idle_timeout_ms() is None

@@ -218,7 +218,7 @@ def test_layer_major_prefill_falls_back_for_empty_multimodal_marker():
 
 
 @pytest.mark.parametrize(
-    ("prompt_len", "expected_len"), [(32_768, 32_768), (32_769, 4096)]
+    ("prompt_len", "expected_len"), [(32_768, 32_768), (32_769, 32_768), (200_000, 32_768)]
 )
 def test_layer_major_prefill_has_a_hard_request_size_bound(prompt_len, expected_len):
     """The scheduler's admission bound controls retained activation memory."""

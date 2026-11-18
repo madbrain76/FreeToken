@@ -638,6 +638,8 @@ class Engine:
         if linear_group is not None:
             from freetoken.kvcache.linear_state_pool import LinearStatePool
 
+            # Naive caching has no tree to hang a checkpoint on, so the bank would be dead RAM.
+            host_slots = 0 if config.cache_type == "naive" else config.mamba_host_slots
             self.linear_state_pool = LinearStatePool(
                 group=linear_group,
                 num_slots=_linear_pool_num_slots(config),
@@ -645,7 +647,15 @@ class Engine:
                 device=self.device,
                 tp_size=config.tp_info.size,
                 slot_states=config.slot_states,
+                host_slots=host_slots,
             )
+            if host_slots > 1:
+                per_slot = self.linear_state_pool.host_bytes_per_slot()
+                logger.info_rank0(
+                    f"GDN host snapshot bank: {host_slots - 1} pinned host slots x "
+                    f"{mem_GB(per_slot)} = {mem_GB(host_slots * per_slot)} pinned in total (slot 0 "
+                    "is the padding sink; not charged against the GPU cache budget)"
+                )
             self.ctx.linear_state_pool = self.linear_state_pool
         else:
             self.linear_state_pool = None
@@ -702,6 +712,17 @@ class Engine:
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
+
+        self._maybe_preseed_moe_cache(config)
+
+    def _maybe_preseed_moe_cache(self, config: EngineConfig) -> None:
+        if self.moe_offload_cache is None:
+            return
+        preseed_enabled = (
+            config.moe_preseed if config.moe_preseed is not None else config.moe_prefill_hit_d2d
+        )
+        if preseed_enabled:
+            self.moe_offload_cache.preseed()
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -852,11 +873,26 @@ class Engine:
 
         cache_per_page, fixed_cache_size, page_tokens, _min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)
+        spec_fixed, draft_page = self._spec_budget(config)
+        fixed_cache_size += spec_fixed
+        cache_per_page += draft_page
         per_expert = expert_bytes_per_slot(banks.sources)
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
         budget = net_cache_budget_bytes(
             config.memory_ratio, self._baseline_free, self._weights_bytes, fixed_cache_size
+        )
+        # Leave about 900 MiB free per 16 GiB card once the process is resident.
+        # 224 MiB of reserve captured graphs at 0.86 GiB and settled near 720 MiB;
+        # 400 MiB of reserve puts the idle free memory on the 900 MiB mark.
+        activation_reserve = 400 * 1024 * 1024
+        if budget <= activation_reserve:
+            raise ValueError(
+                f"elastic KV budget {budget} B is below the {activation_reserve} B activation reserve"
+            )
+        budget -= activation_reserve
+        logger.info_rank0(
+            f"elastic KV budget holds back {activation_reserve / 2**30:.1f} GiB for graphs and prefill"
         )
         max_slots = min(size_cap, total_experts)
         # Rebuild refuses a slot count below the per-pool decode floor (top-k * max running).
@@ -897,6 +933,56 @@ class Engine:
             max_slots=max_slots,
             moe_floor=moe_floor,
         )
+        # per_expert_bytes is a mean. Per-layer pools are wider than that mean, so the
+        # planned slot count can exceed the budget and leave no room for the prefill activation.
+        kv_bytes = pages * cache_per_page
+        fit_pools = self._moe_pools(decode_batch)
+        lo, hi = moe_floor, moe
+        best = None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            try:
+                sizes = split_slots(mid, fit_pools, self._moe_expert_counts)
+            except ValueError:
+                lo = mid + 1
+                continue
+            if self._moe_pool_bytes(sizes) + kv_bytes <= budget:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        if best is None:
+            raise ValueError(
+                f"elastic KV of {pages * page_tokens} tokens does not fit beside {moe_floor} expert slots"
+            )
+        if best != moe:
+            logger.info_rank0(
+                f"elastic KV: MoE slots {moe} -> {best} so the per-layer pools stay inside the VRAM budget"
+            )
+        moe = best
+        pinned = config.moe_cache_size
+        if pinned > 0:
+            if pinned < moe_floor:
+                raise ValueError(
+                    f"--moe-cache-size {pinned} is below the elastic floor of {moe_floor} slots"
+                )
+            pinned_bytes = self._moe_pool_bytes(
+                split_slots(pinned, fit_pools, self._moe_expert_counts)
+            )
+            if pinned_bytes + kv_bytes > budget + activation_reserve:
+                raise ValueError(
+                    f"--moe-cache-size {pinned} does not fit beside {pages * page_tokens} KV tokens"
+                )
+            if pinned != best:
+                logger.info_rank0(
+                    f"elastic KV: pinned MoE slots {pinned} (budget would allow {best})"
+                )
+            moe = pinned
+        overlap = bool(config.moe_prefill_overlap and moe >= 2 * num_experts)
+        actual = self._moe_pool_bytes(split_slots(moe, fit_pools, self._moe_expert_counts))
+        # Later grows replan from one byte rate. Use the real pool cost so they cannot
+        # exceed the budget the way the layer-mean estimate does.
+        per_expert = max(per_expert, (actual + moe - 1) // moe)
         if config.num_page_override not in (None, pages) or config.moe_cache_size not in (0, moe):
             logger.info_rank0(
                 "elastic KV replaces the fixed MoE/KV sizes "
@@ -905,6 +991,8 @@ class Engine:
         object.__setattr__(config, "moe_cache_size", moe)
         object.__setattr__(config, "moe_prefill_overlap", overlap)
         object.__setattr__(config, "num_page_override", pages)
+        qwen4 = getattr(config.model_config, "qwen4_args", None)
+        activation_width = int(qwen4.hc_count * qwen4.hidden_size) if qwen4 is not None else 0
         self.elastic_kv = ElasticKv(
             budget_bytes=budget,
             per_expert_bytes=per_expert,
@@ -917,6 +1005,8 @@ class Engine:
             moe_floor=moe_floor,
             initial_tokens=pages * page_tokens,
             max_tokens=ceiling,
+            initial_moe_slots=moe,
+            activation_width=activation_width,
         )
         logger.info_rank0(
             f"elastic KV: start {self.elastic_kv.initial_tokens} tokens, "
@@ -1113,6 +1203,7 @@ class Engine:
             cache_size=config.moe_cache_size,
             device=self.device,
             cache_policy=config.moe_cache_policy,
+            prefill_demand_tokens=config.moe_prefill_demand_tokens,
             prefill_overlap=config.moe_prefill_overlap,
             prefill_hit_d2d=config.moe_prefill_hit_d2d,
             quant_format=banks.quant_format,
@@ -1478,13 +1569,20 @@ class Engine:
         # FrozenInstanceError, which here aborts the rebuild after the CUDA graphs are gone (→ 503).
         if num_swa_pages is not None:
             object.__setattr__(config, "swa_num_pages_override", num_swa_pages)
+        # Apply shrinking cache resizes before growing ones so mixed-direction rebuilds
+        # (e.g. elastic KV shrinking back to 32K while MoE grows back to 15K) free VRAM first.
+        kv_shrinking = num_pages is not None and num_pages < self.num_pages
+        if kv_shrinking:
+            self._resize_kv_pool(config, num_pages, num_swa_pages)
+            torch.cuda.empty_cache()
         if moe_cache_size is not None:
             assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
             self.moe_offload_cache.rebuild(moe_cache_size, moe_pool_sizes)
-        if num_pages is not None:
+            self._maybe_preseed_moe_cache(config)
+        if not kv_shrinking and num_pages is not None:
             # sets self.num_pages (rebuilds KV + window)
             self._resize_kv_pool(config, num_pages, num_swa_pages)
-        elif num_swa_pages is not None:
+        elif not kv_shrinking and num_swa_pages is not None:
             # Window-only change: no page-count change, but re-derive the window pool at the new
             # pin against the CURRENT page count. This re-allocs the same-size full pool and
             # the resized window, both inside the pool's own rebuild_from_config.
@@ -1584,7 +1682,18 @@ class Engine:
             req.complete_one()
 
         batch_logits = logits[: batch.size]
-        next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        if self.config.tp_info.is_primary():
+            next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        else:
+            next_tokens_gpu = torch.empty(batch.size, dtype=torch.int32, device=self.device)
+        if self.config.tp_info.size > 1:
+            from freetoken.distributed import DistributedCommunicator
+            DistributedCommunicator().broadcast(next_tokens_gpu, src=0)
+        if not self.config.tp_info.is_primary() and args.penalties:
+            for row, counts, _, _ in args.penalties:
+                counts.scatter_add_(
+                    0, next_tokens_gpu[row : row + 1].long(), counts.new_ones(1)
+                )
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
@@ -2080,8 +2189,10 @@ _DENSE_MOE_SETTINGS = {
     "moe_hybrid_max_fetch": -1,
     "moe_locked_fetch": -1.0,
     "moe_locked_max_fetch": 8,
+    "moe_prefill_demand_tokens": 0,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
+    "moe_preseed": False,
     "expert_load": "auto",
 }
 

@@ -270,8 +270,11 @@ class Scheduler(SchedulerIOMixin):
             or self._kv_wait  # an idle grow has to run; blocking here would wait for another request
             or self._pending_flush is not None  # a deferred flush to run at idle or time out
         )
-        for msg in self.receive_msg(blocking=blocking):
+        msgs = self.receive_msg(blocking=blocking)
+        for msg in msgs:
             self._process_one_msg(msg)
+        if blocking and not msgs:
+            self._maybe_shrink_kv()
 
         # Execute a queued cache rebuild once the scheduler is fully idle (the safe point):
         # no last batch to process, no pending prefill, no running decode. finished_reqs is
@@ -322,8 +325,11 @@ class Scheduler(SchedulerIOMixin):
             or self._kv_wait
             or self._pending_flush is not None  # a deferred flush to run at idle or time out
         )
-        for msg in self.receive_msg(blocking=blocking):
+        msgs = self.receive_msg(blocking=blocking)
+        for msg in msgs:
             self._process_one_msg(msg)
+        if blocking and not msgs:
+            self._maybe_shrink_kv()
 
         # Non-overlap mode has no last_data to drain; execute a queued rebuild as soon as
         # the scheduler is idle (no pending prefill / running decode). Without this, a
@@ -874,6 +880,44 @@ class Scheduler(SchedulerIOMixin):
     def _aligned_kv_need(self, input_len: int, max_tokens: int, page_size: int) -> int:
         return div_ceil(input_len + max_tokens + self.prefill_manager.token_headroom, page_size) * page_size
 
+    def idle_timeout_ms(self) -> int | None:
+        """Wake from idle blocking recv after ELASTIC_KV_SHRINK_IDLE_SEC when KV is expanded."""
+        if self.config.offline_mode:
+            return None
+        idle_s = ENV.ELASTIC_KV_SHRINK_IDLE_SEC.value
+        if idle_s <= 0:
+            return None
+        ek = getattr(self.engine, "elastic_kv", None)
+        if ek is None:
+            return None
+        current = self.engine.num_pages * ek.page_size
+        if ek.shrink_target(current) is None:
+            return None
+        return max(1, int(idle_s * 1000))
+
+    def _maybe_shrink_kv(self) -> None:
+        """When woken from an idle timeout with no new messages, shrink KV back to initial."""
+        if self.config.offline_mode:
+            return
+        ek = getattr(self.engine, "elastic_kv", None)
+        if ek is None or self._kv_wait:
+            return
+        if self.prefill_manager.runnable or self.decode_manager.runnable:
+            return
+        current = self.engine.num_pages * ek.page_size
+        plan = ek.shrink_target(current)
+        if plan is None:
+            return
+        moe, pages = plan
+        logger.info_rank0(
+            f"elastic KV: idle shrink {current} -> {pages * ek.page_size} tokens, "
+            f"MoE slots -> {moe}"
+        )
+        self.rebuild_cache(moe_cache_size=moe, num_pages=pages)
+        torch.cuda.empty_cache()
+        self._log_cache_geometry("Cache rebuilt (elastic KV idle shrink)")
+        self._reply_rebuild("elastic_kv", "ok")
+
     def _maybe_grow_kv(self) -> None:
         """When idle, grow the KV pool to cover the parked requests and shrink the MoE cache.
 
@@ -913,6 +957,8 @@ class Scheduler(SchedulerIOMixin):
             )
             self.rebuild_cache(moe_cache_size=moe, num_pages=pages)
             torch.cuda.empty_cache()
+            self._log_cache_geometry("Cache rebuilt (elastic KV)")
+            self._reply_rebuild("elastic_kv", "ok")
             current = self.engine.num_pages * ek.page_size
         self._admit_kv_wait(current, ek.max_tokens, ek.page_size)
 

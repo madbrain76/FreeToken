@@ -72,6 +72,9 @@ class EnvClassSingleton:
     DISABLE_OVERLAP_SCHEDULING = EnvBool(False)
     PYNCCL_MAX_BUFFER_SIZE = EnvMem(1024**3)
     STEP_TIMEOUT = EnvFloat(120.0)
+    # Idle seconds after which an expanded elastic KV pool shrinks back to --kv-initial-tokens
+    # and restores the initial MoE slot cache; set to 0 to disable automatic idle shrink.
+    ELASTIC_KV_SHRINK_IDLE_SEC = EnvFloat(120.0)
     DISTRIBUTED_TIMEOUT = EnvFloat(2592000.0)
     # GatedDeltaNet recurrent (SSM) state dtype: float32 (default) | bfloat16 | float16.
     # fp32 matches the Qwen3.x configs (mamba_ssm_dtype); fp16/bf16 halves the GDN state
