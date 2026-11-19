@@ -17,23 +17,13 @@ def _pad_scale(rows: int, cols: int) -> int:
     return fp8_block_scale_pad(rows, cols)
 
 
-def fp8_expert_block_bounds(intermediate: int, tp_rank: int, tp_size: int) -> tuple[int, int]:
-    blocks = intermediate // BLOCK
-    if intermediate % BLOCK or blocks < tp_size:
-        raise ValueError(
-            f"block-fp8 TP needs at least one {BLOCK}-wide block per rank; "
-            f"got intermediate={intermediate}, tp={tp_size}"
-        )
-    return tp_rank * blocks // tp_size, (tp_rank + 1) * blocks // tp_size
-
-
 class TritonFp8BlockMoEKernel(MoEKernel):
     name = "triton"
     cpu_format = "fp8_block"
     supports_inactive_slots = True
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
-        reason = self._common_reject(cfg, tp_ok=True, cpu_ok=cfg.tp_size == 1, plain_silu_only=False)
+        reason = self._common_reject(cfg, tp_ok=False, cpu_ok=True, plain_silu_only=False)
         if reason:
             return reason
         if cfg.scheme is not None and fp8_block_size(cfg.scheme) != BLOCK:
@@ -46,12 +36,7 @@ class TritonFp8BlockMoEKernel(MoEKernel):
         return None
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
-        # Split on whole 128-wide scale blocks.  640-wide Qwen3.8 experts on
-        # TP4 become [128, 128, 128, 256], rather than invalid 160-wide slices.
         i, h, b = cfg.intermediate, cfg.hidden, BLOCK
-        if cfg.tp_size > 1:
-            start, stop = fp8_expert_block_bounds(i, cfg.tp_rank, cfg.tp_size)
-            i = (stop - start) * BLOCK
         return {
             "gate_up": BankSpec((2 * i, h), FP8),
             "gate_up_scale": BankSpec((2 * i // b, _pad_scale(2 * i // b, h // b)), torch.bfloat16),

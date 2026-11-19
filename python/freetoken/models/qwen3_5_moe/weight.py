@@ -387,7 +387,8 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, layers=None, para
     ``_scale`` (block scale) companions, named as the checkpoint's dialect stores them. Other expert kinds use the generic readers."""
     if kind is not QuantKind.FP8_BLOCK:
         return None
-    from freetoken.layers.quantization.moe.fp8_block import BLOCK, fp8_expert_block_bounds
+    if get_tp_info().size > 1:
+        raise NotImplementedError("qwen3_5_moe fp8 expert banks support TP=1 only")
     from freetoken.models.weight import experts_scattered, iter_expert_tensors_parallel
     from freetoken.moe.expert_pieces import per_expert_pieces
 
@@ -408,6 +409,14 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, layers=None, para
             return None
         return li, int(m["expert"]), m["proj"] + suffix[m["kind"]]
 
+    if parallel is None:
+        parallel = experts_scattered(model_path)
+    if parallel:
+        tensors = iter_expert_tensors_parallel(
+            model_path, lambda n: locate(n) is not None, workers=workers, chunk=chunk
+        )
+        return per_expert_pieces(tensors, locate, tensors_per_expert=6)
+
     def _serial():
         reader = ShardReader(model_path, torch.device("cpu"))
         try:
@@ -421,32 +430,7 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, layers=None, para
         finally:
             reader.close()
 
-    if parallel is None:
-        parallel = experts_scattered(model_path)
-    tensors = (
-        iter_expert_tensors_parallel(model_path, lambda name: locate(name) is not None, workers=workers, chunk=chunk)
-        if parallel else _serial()
-    )
-    pieces = per_expert_pieces(tensors, locate, tensors_per_expert=6)
-    tp = get_tp_info()
-    if tp.size == 1:
-        return pieces
-    start, stop = fp8_expert_block_bounds(I, tp.rank, tp.size)
-    weight_slice = slice(start * BLOCK, stop * BLOCK)
-    scale_slice = slice(start, stop)
-
-    def _sharded():
-        for layer, first, last, piece in pieces:
-            yield layer, first, last, {
-                "gate": piece["gate"][:, weight_slice],
-                "up": piece["up"][:, weight_slice],
-                "down": piece["down"][:, :, weight_slice],
-                "gate_scale": piece["gate_scale"][:, scale_slice],
-                "up_scale": piece["up_scale"][:, scale_slice],
-                "down_scale": piece["down_scale"][:, :, scale_slice],
-            }
-
-    return _sharded()
+    return per_expert_pieces(_serial(), locate, tensors_per_expert=6)
 
 
 def nvfp4_expert_spec(model_path: str, config) -> Nvfp4ExpertSourceSpec:
