@@ -10,6 +10,7 @@ import torch
 if TYPE_CHECKING:
     from freetoken.core import Batch, Req
     from freetoken.engine.spec_protocol import SpecProposal
+    from freetoken.kvcache.base import BaseKVCachePool
     from freetoken.models.blocks import FeatureSink
     from freetoken.models.config import SlotStateSpec
 
@@ -40,6 +41,8 @@ class DraftContext(NamedTuple):
     dummy_req: Req
     # the tensors of the proposer's slot_states, ``[num_slots, *shape]`` each, on the target's GDN slots
     slot_states: dict[str, torch.Tensor]
+    # the engine's target KV pool, always populated by SpecRunner.attach; a read-only draft reads through it
+    kv_cache: BaseKVCachePool
 
 
 class Proposer:
@@ -52,6 +55,10 @@ class Proposer:
     def adjust_config(cls, config, override) -> None:
         """Raise if this proposer cannot serve the config."""
         pass
+
+    @classmethod
+    def prepare_target(cls, config, model) -> None:
+        """Called with the target's weights loaded, before its kernels finalize them."""
 
     @classmethod
     def num_steps(cls, config) -> tuple[int, int]:
@@ -67,6 +74,11 @@ class Proposer:
     def slot_states(cls, config) -> tuple[SlotStateSpec, ...]:
         """Per-request draft state that rides the target's GDN slots and is copied and restored with them; from the config alone. The proposer writes its own prefill track snapshot."""
         return ()
+
+    @classmethod
+    def target_may_be_windowed(cls, config) -> bool:
+        """Whether this proposer can serve a target with sliding-window or DSV4 window-tier KV; the window frees are only safe for a draft that stores no KV of its own."""
+        return False
 
     def __init__(self, config, target_model) -> None:
         self.config = config

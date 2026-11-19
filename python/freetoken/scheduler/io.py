@@ -67,6 +67,9 @@ class SchedulerIOMixin:
     def run_when_idle(self):
         raise NotImplementedError("should be implemented")
 
+    def idle_timeout_ms(self) -> int | None:
+        return None
+
     def offline_receive_msg(self, blocking: bool = False) -> List[BaseBackendMsg]:
         raise NotImplementedError("should be implemented")
 
@@ -80,7 +83,12 @@ class SchedulerIOMixin:
         pending_msgs: List[BaseBackendMsg] = []
         if blocking:
             self.run_when_idle()
-            pending_msgs.append(self._recv_from_tokenizer.get())
+            timeout_ms = self.idle_timeout_ms()
+            if timeout_ms is not None:
+                if self._recv_from_tokenizer.poll(timeout_ms):
+                    pending_msgs.append(self._recv_from_tokenizer.get())
+            else:
+                pending_msgs.append(self._recv_from_tokenizer.get())
         while not self._recv_from_tokenizer.empty():
             pending_msgs.append(self._recv_from_tokenizer.get())
         return pending_msgs
@@ -89,7 +97,12 @@ class SchedulerIOMixin:
         pending_raw_msgs: List[bytes] = []
         if blocking:
             self.run_when_idle()
-            pending_raw_msgs.append(self._recv_from_tokenizer.get_raw())
+            timeout_ms = self.idle_timeout_ms()
+            if timeout_ms is not None:
+                if self._recv_from_tokenizer.poll(timeout_ms):
+                    pending_raw_msgs.append(self._recv_from_tokenizer.get_raw())
+            else:
+                pending_raw_msgs.append(self._recv_from_tokenizer.get_raw())
 
         while not self._recv_from_tokenizer.empty():
             pending_raw_msgs.append(self._recv_from_tokenizer.get_raw())

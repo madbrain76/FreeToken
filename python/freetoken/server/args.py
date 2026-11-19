@@ -166,6 +166,7 @@ def parse_args(
     """
     from freetoken.attention import validate_attn_backend
     from freetoken.kvcache import SUPPORTED_CACHE_MANAGER
+    from freetoken.kvcache.format import FP8_PER_TOKEN_HEAD, KV_FORMATS, NONE
     from freetoken.moe import MOE_STRATEGIES
     from freetoken.moe.pool_policy import SCOPES
 
@@ -177,6 +178,12 @@ def parse_args(
         except ValueError as exc:
             raise argparse.ArgumentTypeError(str(exc)) from None
         return value
+
+    def _parse_module_list(value: str) -> tuple[str, ...]:
+        names = tuple(p.strip() for p in value.split(",") if p.strip())
+        if not names:
+            raise argparse.ArgumentTypeError("expected comma-separated module names or glob patterns")
+        return names
 
     def _parse_moe_cache_rate(value: str) -> float:
         try:
@@ -540,21 +547,6 @@ def parse_args(
     )
 
     parser.add_argument(
-        "--kv-cache-dtype",
-        dest="kv_quant",
-        type=str,
-        default=ServerArgs.kv_quant,
-        choices=["auto", "bf16", "fp8"],
-        help=(
-            "KV-cache storage format. 'bf16' (default) stores the compute dtype; 'fp8'"
-            " stores e4m3 codes plus one fp32 scale per (token, kv head), roughly "
-            "doubling the tokens that fit in the same VRAM. Requires the triton"
-            " attention backend and a plain paged, hybrid-SWA or QSA sparse KV pool"
-            " (not MLA/DSA, DSV4, or MiniMax-M3 block-sparse models)."
-        ),
-    )
-
-    parser.add_argument(
         "--attention-backend",
         "--attn",
         type=validate_attn_backend,
@@ -588,6 +580,18 @@ def parse_args(
         "(one slot = one whole GDN state, ~110 MB on a Qwen3-Coder-Next-class model) so a long "
         "prompt stays resumable from a boundary in the middle of it, not just from its end. "
         "0 (default) keeps today's behavior and costs no host RAM.",
+    )
+
+    parser.add_argument(
+        "--kv-cache-dtype",
+        type=lambda value: FP8_PER_TOKEN_HEAD.name if value == "fp8" else value,
+        default=ServerArgs.kv_cache_dtype,
+        choices=["auto", *(name for name in KV_FORMATS if name != NONE.name)],
+        help="How K and V are stored. 'auto' keeps the compute dtype. The per_token_head formats store 8 bits per "
+        "element plus one scale per token and head (two per MLA latent row); the triton, qsa_sparse, m3_sparse and dsa "
+        "attention backends read "
+        "them. They need --dtype bfloat16. Tensor parallelism is supported for FP8 QSA KV only. "
+        "'fp8' is an alias for 'fp8_per_token_head'. An mtp draft stores its KV in the same format.",
     )
 
     parser.add_argument(
@@ -849,6 +853,30 @@ def parse_args(
         convert=lambda v: "host" if v == "cpu" else v,
         choices=["gpu", "cpu"],
         help=argparse.SUPPRESS,
+    )
+
+    parser.add_argument(
+        "--online-quant",
+        default=ServerArgs.online_quant,
+        choices=["df11"],
+        help=(
+            "Convert the Linear layers and input embedding tables that the checkpoint stores in bf16 at load. 'df11' "
+            "compresses them losslessly to ~11 bits per weight and decodes them bit-for-bit on use: about 30%% less "
+            "VRAM for those weights, at the cost of a decode per use. The LM head, a table tied to it, vision encoders and "
+            "layers whose weight the model reads directly stay bf16; refused when no layer qualifies."
+        ),
+    )
+
+    parser.add_argument(
+        "--online-quant-modules",
+        default=ServerArgs.online_quant_modules,
+        type=_parse_module_list,
+        help=(
+            "Limit --online-quant to these modules: comma-separated checkpoint module names or glob patterns, "
+            "e.g. 'model.layers.*.self_attn,model.embed_tokens' ('model.language_model.layers.*' where the checkpoint "
+            "nests the text model). A name also covers the modules under it; one that selects no convertible layer is "
+            "refused. Default: every layer --online-quant can convert."
+        ),
     )
 
     parser.add_argument(
@@ -1134,6 +1162,14 @@ def parse_args(
         type=str,
         default=ServerArgs.speculative_draft_model_path,
         help="Draft weights; by default they come from the target checkpoint. Required for dflash, which reads a separate draft checkpoint.",
+    )
+
+    parser.add_argument(
+        "--speculative-token-map",
+        "--spec-token-map",
+        type=str,
+        default=ServerArgs.speculative_token_map,
+        help="File of little-endian int32 token ids the draft may propose (mtp only). The draft computes logits over those LM head rows alone; the target still verifies over the whole vocabulary. Off by default.",
     )
 
     parser.add_argument(

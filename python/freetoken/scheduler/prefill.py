@@ -158,13 +158,15 @@ class PrefillAdder:
         chunk_size = min(self.token_budget, remain_len)
         if (
             self.layer_major
+            and self.token_budget == self.pass_budget
             and remain_len > self.token_budget
-            and remain_len <= _LAYER_MAJOR_MAX_EXTEND_TOKENS
             and pending_req.mm_items is None
             and not self.cache_manager.swa_paged
         ):
-            # The engine splits this measured-size whole request internally.
-            chunk_size = remain_len
+            # Cap each layer-major pass at _LAYER_MAJOR_MAX_EXTEND_TOKENS so long prompts
+            # (>32K) run as bounded 32K layer-major super-chunks instead of falling back
+            # to small ordinary chunks.
+            chunk_size = min(remain_len, _LAYER_MAJOR_MAX_EXTEND_TOKENS)
         if self.cache_manager.swa_paged:
             # Cap this chunk by the swa the pool can back this pass. swa is allocated per token in
             # allocate_paged, and token_budget (max_extend_tokens, default 8192) won't chunk a

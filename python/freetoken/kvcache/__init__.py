@@ -15,6 +15,7 @@ from .base import (
     MatchResult,
     SizeInfo,
 )
+from .format import NONE, KVFormat
 
 
 class CacheManagerCreator(Protocol):
@@ -80,17 +81,6 @@ def resolve_pool_class(model_config: ModelConfig) -> type[BaseKVCachePool]:
     return MHAKVCache
 
 
-def _reject_unsupported_quant(pool: str, kv_quant: str) -> None:
-    """A pool family that has no fp8 store/scale-read path must say so at startup,
-    not silently serve a 16-bit cache the budget priced for an fp8 one."""
-    if kv_quant != "none":
-        raise ValueError(
-            f"--kv-cache-dtype {kv_quant} is not implemented for the {pool} KV pool "
-            "(only the plain paged / hybrid-SWA pools, served by the triton attention "
-            "backend); use --kv-cache-dtype bf16."
-        )
-
-
 def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dtype):
     """Build the engine's KV pool for ``num_pages`` USABLE pages (the dummy page and every
     secondary tier -- window pool, index slab, state rings -- are derived here or inside
@@ -100,12 +90,10 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
     from .dsv4.v4_pool import DSV4PagedKVCache
 
     model_config = config.model_config
-    kv_quant = getattr(config, "kv_quant", "none")
     if resolve_pool_class(model_config) is DSV4PagedKVCache:
         # DSV4 is driven by the generic CacheManager over the shared page table; the pool is
         # the only DSV4-specific piece (the swa_pool plug-in: window tier + cmp/idx/state
         # shadows). Sizing reads dsv4_args, never the group spec.
-        _reject_unsupported_quant("DSV4 paged", kv_quant)
         pool = DSV4PagedKVCache(
             sizes=_dsv4_pool_sizes(config, num_pages + 1),  # +1 for dummy page
             args=model_config.dsv4_args,
@@ -149,8 +137,8 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         device=device,
         dtype=dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
-        kv_quant=kv_quant,
         num_speculative_tokens=getattr(config, "decode_rows_per_req", 1) - 1,
+        kv_format=getattr(config, "kv_format", NONE),
     )
 
 
@@ -162,8 +150,8 @@ def create_kvcache_pool(
     device: torch.device,
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
-    kv_quant: str = "none",
     num_speculative_tokens: int = 0,
+    kv_format: KVFormat = NONE,
 ) -> BaseKVCachePool:
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
@@ -176,7 +164,7 @@ def create_kvcache_pool(
             num_swa_tokens=num_swa_tokens,
             device=device,
             dtype=dtype,
-            kv_quant=kv_quant,
+            kv_format=kv_format,
         )
 
     from .mha_pool import MHAKVCache
@@ -204,7 +192,6 @@ def create_kvcache_pool(
     if len(kv_specs) == 1 and kv_specs[0].attn_type == _AttnType.BSA:
         from .bsa_pool import BSAKVCache
 
-        _reject_unsupported_quant("block-sparse (BSA)", kv_quant)
         spec = kv_specs[0]
         assert layer_ids is None, "hybrid-linear x BSA has no pool support yet"
         return BSAKVCache(
@@ -217,6 +204,7 @@ def create_kvcache_pool(
             device=device,
             index_head_dim=spec.index_head_dim,
             num_index_layers=spec.num_index_layers,
+            kv_format=kv_format,
         )
 
     # QSA (Qwen3.8-Flash-Next): the same GQA group, but it stores one index key per
@@ -244,9 +232,7 @@ def create_kvcache_pool(
             ring_capacity=QSAKVCache.ring_capacity_for(spec.index_ratio, num_speculative_tokens),
             layer_ids=spec.layer_ids,
             mrope=model_config.model_is_mrope,
-            # Quantizes the KV tiers only -- the compressed index slab the score kernel
-            # reads stays the engine dtype (kvcache/qsa_pool.py).
-            kv_quant=kv_quant,
+            kv_format=kv_format,
         )
 
     if len(kv_specs) == 1 and kv_specs[0].mla:
@@ -267,7 +253,7 @@ def create_kvcache_pool(
                 index_head_dim=spec.index_head_dim,
                 num_index_layers=spec.num_index_layers,
                 layer_ids=layer_ids,
-                kv_quant=kv_quant,
+                kv_format=kv_format,
             )
             if spec.index_ratio > 1:
                 # kpool tail rings are keyed by Req.table_idx; + 1 covers the dummy request row.
@@ -287,7 +273,7 @@ def create_kvcache_pool(
             dtype=dtype,
             device=device,
             layer_ids=layer_ids,
-            kv_quant=kv_quant,
+            kv_format=kv_format,
         )
 
     spec = kv_specs[0] if len(kv_specs) == 1 else None
@@ -300,7 +286,7 @@ def create_kvcache_pool(
         device=device,
         dtype=dtype,
         layer_ids=layer_ids,
-        kv_quant=kv_quant,
+        kv_format=kv_format,
     )
 
 

@@ -76,6 +76,9 @@ class ZmqPullQueue(Generic[T]):
     def empty(self) -> bool:
         return self.socket.poll(timeout=0) == 0
 
+    def poll(self, timeout_ms: int) -> bool:
+        return self.socket.poll(timeout=timeout_ms) != 0
+
     def stop(self):
         self.socket.close()
         self.context.term()

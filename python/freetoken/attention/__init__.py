@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol
 
+from freetoken.kvcache.format import ROW_SCALE_FORMATS
 from freetoken.utils import Registry, init_logger
 
 from .base import AttentionSpec, AttnType, BaseAttnBackend, BaseAttnMetadata, HybridBackend
@@ -33,13 +34,10 @@ class BackendInfo:
     # Whether forward() honors a per-call AttentionSpec (window/sm_scale/sinks).
     # Non-consumers raise on a non-None spec instead of silently dropping it.
     consumes_attn_spec: bool = False
-    # Whether forward() reads an fp8 KV pool (codes + per-token/per-head scales).
-    # Backends that hand the cache to an external kernel must opt out until that
-    # kernel is proven to apply our scale layout; the engine then refuses (or auto-
-    # avoids) them for --kv-cache-dtype fp8.
-    supports_fp8_kv: bool = False
     # How the backend captures a graph of `rows_per_req` query rows per request: "device" keeps all metadata on device, "host_plan" plans on the host before each replay, "none" cannot.
     uniform_extend_graph: Literal["none", "host_plan", "device"] = "none"
+    # KV storage formats forward() can read natively (kvcache/format.py names)
+    kv_formats: frozenset[str] = frozenset({"none"})
 
 
 SUPPORTED_ATTENTION_BACKENDS = Registry[BackendCreator]("Attention Backend")
@@ -93,8 +91,8 @@ def create_fa_backend(config: ModelConfig):
     BackendInfo(
         supported_types=frozenset({AttnType.FULL, AttnType.SWA}),
         consumes_attn_spec=True,
-        supports_fp8_kv=True,
         uniform_extend_graph="device",
+        kv_formats=ROW_SCALE_FORMATS,
     ),
 )
 def create_triton_backend(config: ModelConfig):
@@ -125,10 +123,7 @@ def create_dsv41_sparse_backend(config: ModelConfig):
 
 @SUPPORTED_ATTENTION_BACKENDS.register(
     "dsa",
-    BackendInfo(
-        supported_types=frozenset({AttnType.MLA, AttnType.DSA}),
-        supports_fp8_kv=True,
-    ),
+    BackendInfo(supported_types=frozenset({AttnType.MLA, AttnType.DSA}), kv_formats=ROW_SCALE_FORMATS),
 )
 def create_dsa_backend(config: ModelConfig):
     # MLA with a grouped index (index_ratio > 1) is the kpool indexer layout.
@@ -149,6 +144,7 @@ def create_dsa_backend(config: ModelConfig):
         # indices and the block-base-row addressing needs page-aligned 128-row runs.
         # Config-time resolution coerces any other page size here.
         page_sizes=(128,),
+        kv_formats=ROW_SCALE_FORMATS,
     ),
 )
 def create_m3_sparse_backend(config: ModelConfig):
@@ -161,13 +157,11 @@ def create_m3_sparse_backend(config: ModelConfig):
     "qsa_sparse",
     BackendInfo(
         supported_types=frozenset({AttnType.QSA}),
-        # The attend kernel dequantizes on load (kernel/triton/qsa/attend.py); the
-        # compressed index keys it scores against are a separate, always-16-bit tier.
-        supports_fp8_kv=True,
         # 64-token pages: a 4-token compress group never straddles a page, so the
         # compressed row of a group is page_base // 4 + block-in-page.
         page_sizes=(64,),
         uniform_extend_graph="device",
+        kv_formats=ROW_SCALE_FORMATS,
     ),
 )
 def create_qsa_sparse_backend(config: ModelConfig):
@@ -211,6 +205,11 @@ def create_attention_backend(
         backend = p_backend  # both are the same, fall through to single backend
         logger.warning(f"P/D attention backends are the same: {backend}, using single backend.")
 
+    from freetoken.core import get_global_ctx
+
+    kv_format = get_global_ctx().kv_cache.kv_format
+    if kv_format.name not in attention_backend_info(backend).kv_formats:
+        raise ValueError(f"attention backend {backend!r} cannot read {kv_format.name} KV")
     return SUPPORTED_ATTENTION_BACKENDS[backend](config)
 
 

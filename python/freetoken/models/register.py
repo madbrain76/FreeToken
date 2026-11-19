@@ -87,6 +87,7 @@ _GEMMA4_SEGMENTS = (
 _GEMMA4_PACKED = _DENSE_PACKED + _EXPERTS_PACKED
 _GEMMA4_PROCESSOR = "freetoken.mm.processors.gemma4:Gemma4MMProcessor"
 _GEMMA4_UNIFIED_PROCESSOR = "freetoken.mm.processors.gemma4:Gemma4UnifiedMMProcessor"
+_GEMMA4_DRAFTS = (("shared_kv_mtp", "freetoken.models.gemma4.mtp:Gemma4MTPDraft"),)
 
 
 def _gemma4_vision_unserved(section: Any) -> str | None:
@@ -434,12 +435,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         packed_modules_mapping=_GEMMA4_PACKED,
         mm_processor=_GEMMA4_PROCESSOR,
         encoders=_GEMMA4_ENCODERS,
+        spec_drafts=_GEMMA4_DRAFTS,
     ),
     "Gemma4ForCausalLM": ModelSpec(
         "freetoken.models.gemma4",
         "Gemma4ForCausalLM",
         checkpoint_segments=_GEMMA4_SEGMENTS,
         packed_modules_mapping=_GEMMA4_PACKED,
+        spec_drafts=_GEMMA4_DRAFTS,
     ),
     # the gemma-4-12B "Unified" release (model_type gemma4_unified): the gemma4 decoder with a dense feed-forward and a linear vision embedder in place of the ViT tower; audio is not wired
     "Gemma4UnifiedForConditionalGeneration": ModelSpec(
@@ -450,12 +453,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         packed_modules_mapping=_GEMMA4_PACKED,
         mm_processor=_GEMMA4_UNIFIED_PROCESSOR,
         encoders=_GEMMA4_ENCODERS,
+        spec_drafts=_GEMMA4_DRAFTS,
     ),
     "Gemma4UnifiedForCausalLM": ModelSpec(
         "freetoken.models.gemma4",
         "Gemma4ForCausalLM",
         checkpoint_segments=_GEMMA4_SEGMENTS,
         packed_modules_mapping=_GEMMA4_PACKED,
+        spec_drafts=_GEMMA4_DRAFTS,
     ),
     # llama.cpp gemma4 GGUF: the same model classes with every tensor in its packed ggml type; the vision tower comes from an mmproj file and runs in bf16
     "Gemma4GGUFForCausalLM": ModelSpec(
@@ -467,6 +472,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         packed_modules_mapping=_GEMMA4_PACKED,
         mm_processor=_GEMMA4_PROCESSOR,
         encoders=_GEMMA4_ENCODERS,
+        spec_drafts=_GEMMA4_DRAFTS,
     ),
     # the same text GGUF with a gemma4uv mmproj (12B): the text GGUF does not tell the 12B apart, so build_gguf_shim picks this row from the projector
     "Gemma4UnifiedGGUFForCausalLM": ModelSpec(
@@ -478,6 +484,7 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         packed_modules_mapping=_GEMMA4_PACKED,
         mm_processor=_GEMMA4_UNIFIED_PROCESSOR,
         encoders=_GEMMA4_ENCODERS,
+        spec_drafts=_GEMMA4_DRAFTS,
     ),
     "GptOssForCausalLM": ModelSpec(
         "freetoken.models.gpt_oss",
@@ -563,11 +570,13 @@ def _load_attr(module_path: str, attr_name: str) -> Any:
     return getattr(module, attr_name)
 
 
-def checkpoint_quant_config(model_path: str, hf_config: Any, spec: ModelSpec):
-    """The checkpoint's QuantConfig under the family's naming.
+def checkpoint_quant_config(
+    model_path: str, hf_config: Any, spec: ModelSpec, *, online: str | None = None, online_modules: tuple[str, ...] = ()
+):
+    """The checkpoint's QuantConfig under the family's naming, serving its bf16 layers (those ``online_modules`` names, when given) as the ``online`` kind.
 
     A GGUF family gets the GGUF dialect over the file's tensor table, named through the ``to_gguf`` its module exports."""
-    from freetoken.layers.quantization import GGUFConfig, NameMap, QuantConfig
+    from freetoken.layers.quantization import GGUFConfig, NameMap, QuantConfig, QuantKind
 
     name_map = NameMap(roots=spec.checkpoint_roots, segments=spec.checkpoint_segments, packed=spec.packed_modules_mapping)
     if spec.parse_config == "parse_gguf_config":
@@ -575,8 +584,10 @@ def checkpoint_quant_config(model_path: str, hf_config: Any, spec: ModelSpec):
         from freetoken.models.gguf.reader import gguf_tensor_index
 
         types = {name: info.ggml_type for name, info in gguf_tensor_index(hf_config.model_path).items()}
-        return GGUFConfig(types, to_gguf, name_map=name_map, unquantized=spec.unquantized_modules)
-    return QuantConfig.from_hf(hf_config, name_map=name_map, unquantized=spec.unquantized_modules)
+        quant = GGUFConfig(types, to_gguf, name_map=name_map, unquantized=spec.unquantized_modules)
+    else:
+        quant = QuantConfig.from_hf(hf_config, name_map=name_map, unquantized=spec.unquantized_modules)
+    return quant.with_online(QuantKind(online), online_modules) if online else quant
 
 
 def get_model_class(model_architecture: str, model_config: ModelConfig):

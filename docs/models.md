@@ -139,6 +139,10 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   see [ftw-hotfix.md](ftw-hotfix.md) for the affected checkpoints and the repair tool.
 - Muse-Glimmer keeps the attention gate as its own linear next to `qkv_proj`; an FTW converted
   when the gate was fused into `qkvg_proj` no longer loads, reconvert it with `ft checkpoint`.
+- GLM-4.7 (`nvidia/GLM-4.7-NVFP4`) serves its attention and input embedding in bf16, as the checkpoint stores
+  them. `--online-quant df11` compresses them losslessly at load, about 8 GiB less VRAM, at the cost of decoding
+  them on every step; builds before the flag always did this. An FTW of GLM-4.7 converted by such a build stores
+  those weights as DF11 and no longer loads; reconvert it with `ft checkpoint`.
 - NVFP4 global scales are kept in fp32. An NVFP4 FTW that stores them as fp16 (converted by an
   older build) is refused at load; reconvert it with `ft checkpoint`.
 - Qwen3.5 / Qwen3.6 / Qwen3.8-27B load their zero-centred norm weights as stored and add the 1 in
@@ -184,3 +188,4 @@ unset on PCIe GPUs: wider grids add no bandwidth there.
   "reasoning_effort": 37}`, and the checkpoint's encoder validates it. Runtime window-cache
   controls use 128-token pages.
 - Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
+- Gemma-4 serves MTP speculative decoding from an assistant sidecar: unsloth's GGUF repos ship `mtp-*.gguf` files for it; upstream's `google/gemma-4-*-it-assistant` HF release must first go through llama.cpp's `convert_hf_to_gguf.py`, then pass the resulting GGUF with `--spec-draft-model`, see [CLI reference](cli.md#speculative-decoding).

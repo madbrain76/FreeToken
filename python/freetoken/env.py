@@ -76,6 +76,9 @@ class EnvClassSingleton:
     DISABLE_OVERLAP_SCHEDULING = EnvBool(False)
     PYNCCL_MAX_BUFFER_SIZE = EnvMem(1024**3)
     STEP_TIMEOUT = EnvFloat(120.0)
+    # Idle seconds after which an expanded elastic KV pool shrinks back to --kv-initial-tokens
+    # and restores the initial MoE slot cache; set to 0 to disable automatic idle shrink.
+    ELASTIC_KV_SHRINK_IDLE_SEC = EnvFloat(120.0)
     DISTRIBUTED_TIMEOUT = EnvFloat(2592000.0)
     # Fail a request whose engine has gone silent, so a wedged backend cannot strand the
     # client forever: the surviving TP ranks sit in a collective allowed to run for

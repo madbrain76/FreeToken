@@ -323,6 +323,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
             md.block_table,
             md.token_to_req,
             torch.empty_like(q),
+            kv_format=self.kvcache.kv_format,
             k_scale=self.kvcache.k_scale(layer_id),
             v_scale=self.kvcache.v_scale(layer_id),
         )
